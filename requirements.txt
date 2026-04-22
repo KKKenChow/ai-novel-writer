@@ -1,0 +1,6 @@
+# AI小说创作 - 通用API + 本地向量库 依赖
+requests>=2.31.0
+chromadb>=0.4.0
+streamlit>=1.30.0
+python-dotenv>=1.0.0
+graphviz>=0.20.1
