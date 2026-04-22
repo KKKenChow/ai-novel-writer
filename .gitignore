@@ -1,0 +1,47 @@
+# 环境变量（包含API Key等敏感信息）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+env/
+
+# 向量数据库（包含创作内容，不应提交）
+chroma_db/
+
+# 导出的小说文件
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI 编辑器
+.codebuddy/
+.cursor/
+.windsurf/
+.aider*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 临时文件
+*.tmp
+*.log
+
+# Python 版本管理
+.python-version
