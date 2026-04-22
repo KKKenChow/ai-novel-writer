@@ -1,5 +1,7 @@
 # 📖 AI 全链路小说创作工具
 
+[English](README_EN.md) | 中文
+
 > 🚀 低成本AI小说创作，全流程本地向量记忆，兼容主流API
 
 ## ✨ 功能特点
@@ -390,8 +392,7 @@ streamlit run app.py
 ```
 local-ai-novel/
 ├── api/
-│   ├── api_client.py           # 通用大模型API客户端（兼容OpenAI格式）
-│   └── codingplan_client.py    # CodingPlan专用客户端（不推荐用于小说）
+│   └── api_client.py           # 通用大模型API客户端（兼容OpenAI格式）
 ├── vector_store/
 │   └── local_chroma.py         # 本地ChromaDB向量存储封装（含extra_data持久化）
 ├── workflow/
