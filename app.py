@@ -394,6 +394,12 @@ def execute_generation(workflow):
     gc = st.session_state.get("generated_content", {})
     error_msg = None
     
+    # 统一同步 novel_info：每次生成前从 session_state 恢复到 workflow
+    # （Streamlit 每次 rerun 会创建新 workflow 实例，novel_info 默认为空）
+    workflow.novel_info["world_setting"] = gc.get("world_setting", "")
+    workflow.novel_info["characters"] = gc.get("characters", "")
+    workflow.novel_info["outline"] = gc.get("outline", "")
+    
     try:
         if step == "world_setting":
             params = st.session_state.get("gen_params", {})
@@ -503,9 +509,6 @@ def execute_generation(workflow):
         elif step == "consistency":
             params = st.session_state.get("gen_params", {})
             max_tokens = params.get("max_tokens", 4000)
-            workflow.novel_info["world_setting"] = gc.get("world_setting", "")
-            workflow.novel_info["characters"] = gc.get("characters", "")
-            workflow.novel_info["outline"] = gc.get("outline", "")
             
             result = workflow.check_consistency(max_tokens=max_tokens)
             st.session_state["consistency_result"] = result
@@ -514,9 +517,6 @@ def execute_generation(workflow):
         elif step == "relation_graph":
             params = st.session_state.get("gen_params", {})
             max_tokens = params.get("max_tokens", 2000)
-            workflow.novel_info["world_setting"] = gc.get("world_setting", "")
-            workflow.novel_info["characters"] = gc.get("characters", "")
-            workflow.novel_info["outline"] = gc.get("outline", "")
             
             raw_result = workflow.extract_character_relations(max_tokens=max_tokens)
             json_start = raw_result.find("{")
@@ -600,42 +600,44 @@ def main():
         st.session_state["model"] = model
         
         # 各步骤 max_tokens 配置
+        # 模型最大输出token硬限制（大多数32k模型为32768）
+        MAX_MT = 32768
         with st.expander("🔧 高级参数 (max_tokens)", expanded=False):
-            st.caption("控制每步API调用的最大输出token数，值越大输出越长但费用越高")
+            st.caption(f"控制每步API调用的最大输出token数（上限{MAX_MT}），值越大输出越长但费用越高")
             mt_cols1 = st.columns(2)
             with mt_cols1[0]:
-                mt_world = st.number_input("🌍 世界观设定", min_value=500, max_value=80000, 
+                mt_world = st.number_input("🌍 世界观设定", min_value=500, max_value=MAX_MT, 
                     value=st.session_state.get("mt_world", 6000), step=500, key="mt_world_input")
                 st.session_state["mt_world"] = mt_world
             with mt_cols1[1]:
-                mt_chars = st.number_input("👤 人物设定", min_value=500, max_value=80000,
+                mt_chars = st.number_input("👤 人物设定", min_value=500, max_value=MAX_MT,
                     value=st.session_state.get("mt_chars", 6000), step=500, key="mt_chars_input")
                 st.session_state["mt_chars"] = mt_chars
             mt_cols2 = st.columns(2)
             with mt_cols2[0]:
-                mt_outline = st.number_input("📋 小说大纲", min_value=1000, max_value=80000,
-                    value=st.session_state.get("mt_outline", 6000), step=500, key="mt_outline_input")
+                mt_outline = st.number_input("📋 小说大纲", min_value=1000, max_value=MAX_MT,
+                    value=st.session_state.get("mt_outline", 8000), step=500, key="mt_outline_input")
                 st.session_state["mt_outline"] = mt_outline
             with mt_cols2[1]:
-                mt_chapter = st.number_input("📖 生成章节", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_chapter", 30000), step=500, key="mt_chapter_input")
+                mt_chapter = st.number_input("📖 生成章节", min_value=500, max_value=MAX_MT,
+                    value=st.session_state.get("mt_chapter", 16000), step=500, key="mt_chapter_input")
                 st.session_state["mt_chapter"] = mt_chapter
             mt_cols3 = st.columns(2)
             with mt_cols3[0]:
-                mt_continue = st.number_input("✍️ 续写", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_continue", 30000), step=500, key="mt_continue_input")
+                mt_continue = st.number_input("✍️ 续写", min_value=500, max_value=MAX_MT,
+                    value=st.session_state.get("mt_continue", 8000), step=500, key="mt_continue_input")
                 st.session_state["mt_continue"] = mt_continue
             with mt_cols3[1]:
-                mt_polish = st.number_input("🎨 风格润色", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_polish", 30000), step=500, key="mt_polish_input")
+                mt_polish = st.number_input("🎨 风格润色", min_value=500, max_value=MAX_MT,
+                    value=st.session_state.get("mt_polish", 8000), step=500, key="mt_polish_input")
                 st.session_state["mt_polish"] = mt_polish
             mt_cols4 = st.columns(2)
             with mt_cols4[0]:
-                mt_consistency = st.number_input("🔍 一致性检查", min_value=1000, max_value=80000,
+                mt_consistency = st.number_input("🔍 一致性检查", min_value=1000, max_value=MAX_MT,
                     value=st.session_state.get("mt_consistency", 6000), step=500, key="mt_consistency_input")
                 st.session_state["mt_consistency"] = mt_consistency
             with mt_cols4[1]:
-                mt_relation = st.number_input("🕸️ 角色图谱", min_value=1000, max_value=80000,
+                mt_relation = st.number_input("🕸️ 角色图谱", min_value=1000, max_value=MAX_MT,
                     value=st.session_state.get("mt_relation", 6000), step=500, key="mt_relation_input")
                 st.session_state["mt_relation"] = mt_relation
         
@@ -959,6 +961,21 @@ def main():
                 step_labels.append(f"{icon} {name}")
             st.caption(" → ".join(step_labels))
         
+        # 字数统计概览
+        word_parts = []
+        if gc.get("world_setting"):
+            word_parts.append(f"🌍 世界观 {len(gc['world_setting'])}字")
+        if gc.get("characters"):
+            word_parts.append(f"👤 人物 {len(gc['characters'])}字")
+        if gc.get("outline"):
+            word_parts.append(f"📋 大纲 {len(gc['outline'])}字")
+        if gc.get("chapters"):
+            total_chap_words = sum(len(c.get("content", "")) for c in gc["chapters"].values())
+            chap_count = len(gc["chapters"])
+            word_parts.append(f"📖 章节 {chap_count}章/{total_chap_words}字")
+        if word_parts:
+            st.caption("📊 字数统计：" + " ｜ ".join(word_parts))
+        
         # 流程依赖说明
         st.info(
             "📌 **创作流程说明（必须按顺序）**：\n"
@@ -1055,6 +1072,7 @@ def main():
                 with st.expander("📄 原始生成文本（未被修改前的AI输出）", expanded=False):
                     st.text_area("AI原始输出", value=original_text, height=300, key="world_original_view", disabled=True)
             result = st.session_state.generated_content["world_setting"]
+            st.caption(f"📊 当前字数：**{len(result)}** 字")
             edited = st.text_area("✏️ 编辑世界观设定（修改后自动保存）", value=result, height=300)
             if edited != result:
                 st.session_state.generated_content["world_setting"] = edited
@@ -1126,6 +1144,7 @@ def main():
                 with st.expander("📄 原始生成文本（未被修改前的AI输出）", expanded=False):
                     st.text_area("AI原始输出", value=original_text, height=400, key="chars_original_view", disabled=True)
             result = st.session_state.generated_content["characters"]
+            st.caption(f"📊 当前字数：**{len(result)}** 字")
             edited = st.text_area("✏️ 编辑人物设定（修改后自动保存）", value=result, height=400)
             if edited != result:
                 st.session_state.generated_content["characters"] = edited
@@ -1208,6 +1227,7 @@ def main():
                 with st.expander("📄 原始生成文本（未被修改前的AI输出）", expanded=False):
                     st.text_area("AI原始输出", value=original_text, height=400, key="outline_original_view", disabled=True)
             result = st.session_state.generated_content["outline"]
+            st.caption(f"📊 当前字数：**{len(result)}** 字")
             edited = st.text_area("✏️ 编辑大纲（修改后自动保存）", value=result, height=500)
             if edited != result:
                 st.session_state.generated_content["outline"] = edited
@@ -1298,6 +1318,7 @@ def main():
         if "chapters" in st.session_state.generated_content and key in st.session_state.generated_content["chapters"]:
             chap = st.session_state.generated_content["chapters"][key]
             st.markdown(f"### 第 {chapter_num} 章 {chap['title']}")
+            st.caption(f"📊 当前字数：**{len(chap['content'])}** 字")
             edited = st.text_area("✏️ 编辑章节内容（修改后自动保存）", value=chap["content"], height=600, key=f"chapter_edit_{key}")
             if edited != chap["content"]:
                 st.session_state.generated_content["chapters"][key]["content"] = edited

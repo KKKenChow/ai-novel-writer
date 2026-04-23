@@ -1,9 +1,12 @@
 """
 全链路小说创作工作流
 """
+import logging
 from typing import Dict, List, Optional
 from api.api_client import LLMAPIClient
 from vector_store.local_chroma import LocalNovelVectorStore
+
+logger = logging.getLogger(__name__)
 
 class FullNovelWorkflow:
     def __init__(self, api_client: LLMAPIClient, vector_store: LocalNovelVectorStore):
@@ -21,6 +24,7 @@ class FullNovelWorkflow:
 2. 主要的地理/世界构架
 3. 核心的力量体系/规则（如果是玄幻/科幻）
 4. 主要的势力格局
+5. 写作视角或风格的额外补充
 
 请用清晰的结构输出："""
 
@@ -105,9 +109,6 @@ class FullNovelWorkflow:
         第一阶段：生成卷级大纲（故事主线 + 分卷规划 + 每卷概要）
         第二阶段：逐卷补全每章简要内容
         """
-        import logging
-        logger = logging.getLogger(__name__)
-        
         # ---- 第一阶段：生成卷级大纲 ----
         logger.info(f"大纲两阶段生成 → 第一阶段：卷级大纲（共{total_chapters}章）")
         stage1_prompt = f"""请根据以下信息，创作这部小说的分卷大纲。
@@ -207,8 +208,6 @@ class FullNovelWorkflow:
         如果解析失败则尝试从自由文本中提取。
         """
         import re
-        import logging
-        logger = logging.getLogger(__name__)
         
         volumes = []
         
@@ -308,6 +307,9 @@ class FullNovelWorkflow:
     def generate_chapter(self, chapter_num: int, chapter_title: str, previous_summary: str = "", max_tokens: int = 2500, target_words: int = 2000) -> str:
         """生成单章正文 — 优化上下文：分类检索设定+前章，避免臃肿"""
         
+        logger.info(f"===== generate_chapter 开始 =====")
+        logger.info(f"参数: chapter_num={chapter_num}, chapter_title={chapter_title}, max_tokens={max_tokens}, target_words={target_words}")
+        
         # ---- 分类构建上下文，避免一次性塞入过多内容 ----
         context_parts = []
         
@@ -317,25 +319,41 @@ class FullNovelWorkflow:
         outline_text = self.novel_info.get("outline", "")
         
         if setting_text:
-            # 世界观设定截断，最多 1500 字
-            trunc = setting_text[:1500] + ("..." if len(setting_text) > 1500 else "")
+            # 世界观设定截断，最多 4000 字
+            SETTING_MAX = 4000
+            trunc = setting_text[:SETTING_MAX] + ("..." if len(setting_text) > SETTING_MAX else "")
             context_parts.append(f"【世界观设定】\n{trunc}")
+            logger.info(f"世界观设定: 原始{len(setting_text)}字 → 传入{len(trunc)}字 (上限{SETTING_MAX})")
+        else:
+            logger.info("世界观设定: 无")
+            
         if character_text:
-            # 人物设定截断，最多 2000 字
-            trunc = character_text[:2000] + ("..." if len(character_text) > 2000 else "")
+            # 人物设定截断，最多 6000 字
+            CHAR_MAX = 6000
+            trunc = character_text[:CHAR_MAX] + ("..." if len(character_text) > CHAR_MAX else "")
             context_parts.append(f"【人物设定】\n{trunc}")
+            logger.info(f"人物设定: 原始{len(character_text)}字 → 传入{len(trunc)}字 (上限{CHAR_MAX})")
+        else:
+            logger.info("人物设定: 无")
+            
         if outline_text:
             # 大纲中提取当前章节附近的内容（优先取相关部分）
             outline_for_chapter = self._extract_relevant_outline(outline_text, chapter_num)
             context_parts.append(f"【小说大纲（当前章节相关）】\n{outline_for_chapter}")
+            logger.info(f"小说大纲: 原始{len(outline_text)}字 → 提取相关{len(outline_for_chapter)}字")
+        else:
+            logger.info("小说大纲: 无")
         
         # 2. 前几章摘要：只取最近2章的末尾段落作为前情回顾，不传全文
-        prev_chapters_summary = self._get_previous_chapters_summary(chapter_num, max_chars=800)
+        prev_chapters_summary = self._get_previous_chapters_summary(chapter_num, max_chars=1500)
         if prev_chapters_summary:
             context_parts.append(f"【前情回顾】\n{prev_chapters_summary}")
+            logger.info(f"前情回顾: {len(prev_chapters_summary)}字")
+        else:
+            logger.info("前情回顾: 无")
         
         # 3. 语义搜索补充：用当前章节标题在向量库做语义搜索(n_results=3)
-        #    跳过已直接包含的设定/人物/大纲(避免重复)，其他章节内容每条截取前500字
+        #    跳过已直接包含的设定/人物/大纲(避免重复)，其他章节内容每条截取前800字
         query = f"第{chapter_num}章 {chapter_title}"
         related = self.vs.search_related(query, n_results=3)
         extra_context = []
@@ -347,31 +365,69 @@ class FullNovelWorkflow:
                 continue  # 这些已经从 novel_info 直接获取了
             # 前章内容只取短片段
             if meta.get("type") == "chapter":
-                content = content[:500] + ("..." if len(content) > 500 else "")
-            extra_context.append(content[:600])
+                content = content[:800] + ("..." if len(content) > 800 else "")
+            extra_context.append(content[:1000])
         
         if extra_context:
-            context_parts.append(f"【相关参考片段】\n" + "\n---\n".join(extra_context))
+            combined_extra = "\n---\n".join(extra_context)
+            context_parts.append(f"【相关参考片段】\n{combined_extra}")
+            logger.info(f"语义搜索补充: {len(extra_context)}条, 共{len(combined_extra)}字")
+        else:
+            logger.info("语义搜索补充: 无")
         
         context_text = "\n\n".join(context_parts)
+        logger.info(f"上下文总计: {len(context_text)}字")
         
         if previous_summary:
             context_text += f"\n\n上一章内容回顾：{previous_summary}\n"
-        
+            logger.info(f"上一章回顾: {len(previous_summary)}字")
+
         prompt = f"""请你根据以下信息，写出小说第 {chapter_num} 章 "{chapter_title}" 的完整正文。
 
 {context_text}
 
-要求：
-- 字数大约在{target_words}字左右
+【硬性要求】
+- 本章必须写到至少 {target_words} 字以上（绝对不能低于此数的80%）
+- 如果一次写不完，请在段落中间自然断开，不要写总结性结尾，不要写"本章完"之类的结束语
 - 情节符合大纲走向
 - 保持人物设定一致性
-- 文笔流畅，有画面感
+- 文笔流畅，有画面感、细节描写丰富（大量使用对话、动作、心理、环境描写来扩充篇幅）
 - 直接输出正文，不要解释
 
 正文："""
 
+        logger.info(f"完整prompt长度: {len(prompt)}字 (约{len(prompt)*2}token)")
+        logger.info(f"API调用参数: model={self.api.model}, max_tokens={max_tokens}, temperature=0.8")
+
         result = self.api.generate(prompt, temperature=0.8, max_tokens=max_tokens)
+
+        # 自动续写：如果输出太短，续写到接近目标字数
+        min_chars = int(target_words * 0.7)  # 至少达到目标的70%
+        max_continuations = 3  # 最多续写3轮，防止无限循环
+        continuation_round = 0
+        while len(result) < min_chars and continuation_round < max_continuations:
+            remaining = target_words - len(result)
+            continuation_round += 1
+
+            continue_prompt = f"""请继续往下写本章剩余内容。
+
+当前已写 {len(result)} 字，还需要再写至少 {remaining} 字才能完成本章。
+
+【前文末尾】
+{result[-1500:]}
+
+继续写下去，保持风格一致，不要写总结性结尾，直接输出续写内容："""
+
+            # 续写时的 token 预算：按剩余字数的2倍估算（中文字符≈1.5-2 token）
+            continue_max = min(max_tokens, max(2000, int(remaining * 2)))
+            continuation = self.api.generate(continue_prompt, temperature=0.8, max_tokens=continue_max)
+            result = result + continuation
+
+            logger.info(f"章节第{chapter_num}章续写第{continuation_round}轮：原始长度={len(result) - len(continuation)}字 + 续写{len(continuation)}字 = 总计{len(result)}字")
+
+        if len(result) < min_chars:
+            logger.warning(f"章节第{chapter_num}章经{max_continuations}轮续写后仍仅{len(result)}字，目标{target_words}字")
+
         # 保存到向量库，方便后续章节检索
         self.vs.add_section("chapter", f"chapter_{chapter_num}", f"第{chapter_num}章 {chapter_title}\n{result}")
         return result
@@ -384,7 +440,7 @@ class FullNovelWorkflow:
         
         # 如果大纲没有章节标记格式，直接截断返回
         if not has_chapter_markers:
-            return outline[:2000] + ("..." if len(outline) > 2000 else "")
+            return outline[:3000] + ("..." if len(outline) > 3000 else "")
         
         relevant_lines = []
         capturing = True  # 默认捕获（大纲开头总述部分也要）
@@ -411,9 +467,9 @@ class FullNovelWorkflow:
         result = "\n".join(relevant_lines).strip()
         # 如果提取结果为空或太短，退回到截断策略
         if not result or len(result) < 20:
-            result = outline[:2000] + ("..." if len(outline) > 2000 else "")
-        elif len(result) > 2000:
-            result = result[:2000] + "..."
+            result = outline[:3000] + ("..." if len(outline) > 3000 else "")
+        elif len(result) > 3000:
+            result = result[:3000] + "..."
         return result
     
     def _get_previous_chapters_summary(self, current_chapter_num: int, max_chars: int = 800) -> str:

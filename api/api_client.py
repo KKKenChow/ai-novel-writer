@@ -20,8 +20,16 @@ class LLMAPIClient:
         self.timeout = timeout
         self.max_retries = max_retries
     
+    # 模型最大输出token限制（大多数32k模型的硬上限）
+    MAX_TOKENS_LIMIT = 32768
+
     def chat(self, messages: List[Dict], temperature=0.7, max_tokens=2000) -> str:
         """调用大模型聊天接口，支持自动重试"""
+        # 防御性截断：max_tokens 不得超过模型最大输出限制
+        if max_tokens > self.MAX_TOKENS_LIMIT:
+            logger.warning(f"max_tokens={max_tokens} 超过模型上限 {self.MAX_TOKENS_LIMIT}，自动截断")
+            max_tokens = self.MAX_TOKENS_LIMIT
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
