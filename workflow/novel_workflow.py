@@ -54,11 +54,29 @@ class FullNovelWorkflow:
         return {"characters": result}
     
     def generate_outline(self, user_prompt: str, total_chapters: int = 50, words_per_chapter: int = 2000, max_tokens: int = 4000) -> str:
-        """第三步：生成总体大纲"""
+        """第三步：生成总体大纲（大章节量时自动分卷两阶段生成）"""
         # 获取已有上下文
         world_setting = self.novel_info.get("world_setting", "")
         characters = self.novel_info.get("characters", "")
         
+        # 章节数较多时（>60），采用两阶段生成：先卷级大纲，再逐卷补全章节
+        if total_chapters > 60:
+            result = self._generate_outline_two_stage(
+                user_prompt, total_chapters, words_per_chapter, max_tokens,
+                world_setting, characters
+            )
+        else:
+            result = self._generate_outline_single(
+                user_prompt, total_chapters, words_per_chapter, max_tokens,
+                world_setting, characters
+            )
+        
+        self.vs.add_section("outline", "full_outline", result)
+        self.novel_info["outline"] = result
+        return result
+    
+    def _generate_outline_single(self, user_prompt, total_chapters, words_per_chapter, max_tokens, world_setting, characters):
+        """单次生成大纲（章节数较少时使用）"""
         prompt = f"""请根据以下信息，创作这部小说的分卷/分章大纲。
 总共规划 {total_chapters} 章，每章大约 {words_per_chapter} 字。
 
@@ -75,12 +93,217 @@ class FullNovelWorkflow:
 2. 分卷规划
 3. 每章简要内容（一句话概括）
 
-大纲要起承转合，有节奏起伏："""
+大纲要起承转合，有节奏起伏。
 
-        result = self.api.generate(prompt, temperature=0.7, max_tokens=max_tokens)
-        self.vs.add_section("outline", "full_outline", result)
-        self.novel_info["outline"] = result
-        return result
+【重要】你必须写出全部 {total_chapters} 章的简要内容，不能中途停止或省略。
+如果内容较长，请持续输出直到写完所有章节，绝不要用"以此类推"或省略号代替。"""
+
+        return self.api.generate(prompt, temperature=0.7, max_tokens=max_tokens)
+    
+    def _generate_outline_two_stage(self, user_prompt, total_chapters, words_per_chapter, max_tokens, world_setting, characters):
+        """两阶段生成大纲（章节数较多时使用）
+        第一阶段：生成卷级大纲（故事主线 + 分卷规划 + 每卷概要）
+        第二阶段：逐卷补全每章简要内容
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # ---- 第一阶段：生成卷级大纲 ----
+        logger.info(f"大纲两阶段生成 → 第一阶段：卷级大纲（共{total_chapters}章）")
+        stage1_prompt = f"""请根据以下信息，创作这部小说的分卷大纲。
+总共规划 {total_chapters} 章，每章大约 {words_per_chapter} 字。
+
+世界观设定：
+{world_setting}
+
+人物设定：
+{characters}
+
+用户需求：{user_prompt}
+
+请严格按照以下格式输出（不要使用其他格式）：
+
+故事主线：200字以内概括整体故事走向
+
+[卷]
+卷名：第一卷的名称
+章节：1-{total_chapters // 5}章
+剧情：该卷的核心剧情和冲突（100-200字）
+[/卷]
+
+[卷]
+卷名：第二卷的名称
+章节：{total_chapters // 5 + 1}-{2 * total_chapters // 5}章
+剧情：该卷的核心剧情和冲突（100-200字）
+[/卷]
+
+（按此格式继续列出所有卷）
+
+【重要】
+- 只需要写到"卷"的级别，不需要写出每章内容
+- 必须用 [卷]...[/卷] 标签包裹每一卷的信息
+- 章节范围必须是"起始章-结束章"的格式，如"1-30章"
+- 必须覆盖全部 {total_chapters} 章
+- 大纲要起承转合，有节奏起伏"""
+
+        stage1_result = self.api.generate(stage1_prompt, temperature=0.7, max_tokens=max_tokens)
+        logger.info(f"大纲第一阶段完成，卷级大纲长度: {len(stage1_result)} 字符")
+        logger.debug(f"卷级大纲原文：\n{stage1_result}")
+        
+        # ---- 第二阶段：逐卷补全章节大纲 ----
+        # 从卷级大纲中解析出各卷信息
+        volumes = self._parse_volumes(stage1_result, total_chapters)
+        
+        if not volumes:
+            # 解析失败，回退到单次生成（加上强制写完的指令）
+            logger.warning("卷级大纲解析失败，回退到单次生成")
+            return self._generate_outline_single(
+                user_prompt, total_chapters, words_per_chapter, max_tokens,
+                world_setting, characters
+            )
+        
+        logger.info(f"解析出 {len(volumes)} 卷，开始逐卷补全章节大纲")
+        
+        # 先把卷级大纲作为基础
+        all_parts = [stage1_result, "\n\n---\n\n## 逐章大纲\n"]
+        
+        for vol in volumes:
+            vol_name = vol["name"]
+            vol_chapters = vol["chapters"]
+            vol_plot = vol["plot"]
+            
+            if vol_chapters <= 0:
+                continue
+            
+            stage2_prompt = f"""请为以下这卷小说补全每章的简要内容。
+
+【故事主线与分卷规划】
+{stage1_result}
+
+【当前需要补全的卷】
+卷名：{vol_name}
+该卷章节数：{vol_chapters} 章
+该卷核心剧情：{vol_plot}
+
+请为这 {vol_chapters} 章逐一写出简要内容（每章一句话概括）。
+
+格式要求：
+第 X 章：章节标题 —— 一句话概括
+
+【重要】你必须写完这 {vol_chapters} 章的全部内容，不能中途停止或省略。"""
+
+            vol_result = self.api.generate(stage2_prompt, temperature=0.7, max_tokens=max_tokens)
+            all_parts.append(f"### {vol_name}\n{vol_result}\n\n")
+            logger.info(f"卷「{vol_name}」补全完成，长度: {len(vol_result)} 字符")
+        
+        final_result = "".join(all_parts)
+        logger.info(f"大纲两阶段生成完成，总长度: {len(final_result)} 字符")
+        return final_result
+    
+    def _parse_volumes(self, volume_outline: str, total_chapters: int) -> list:
+        """从卷级大纲中解析出各卷信息，返回 [{"name": "卷名", "chapters": 章节数, "plot": "剧情概要"}]
+        
+        优先解析 [卷]...[/卷] 结构化格式（prompt 要求的固定格式），
+        如果解析失败则尝试从自由文本中提取。
+        """
+        import re
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        volumes = []
+        
+        # ---- 优先解析结构化格式 [卷]...[/卷] ----
+        vol_blocks = re.findall(r'\[卷\](.*?)\[/卷\]', volume_outline, re.DOTALL)
+        if vol_blocks:
+            for block in vol_blocks:
+                vol_name = ""
+                chapters = 0
+                plot = ""
+                
+                # 提取卷名
+                name_m = re.search(r'卷名[：:]\s*(.+)', block)
+                if name_m:
+                    vol_name = name_m.group(1).strip()
+                
+                # 提取章节范围
+                ch_m = re.search(r'章节[：:]\s*(\d+)\s*[-–—]\s*(\d+)\s*章?', block)
+                if ch_m:
+                    chapters = int(ch_m.group(2)) - int(ch_m.group(1)) + 1
+                
+                # 提取剧情
+                plot_m = re.search(r'剧情[：:]\s*(.+)', block, re.DOTALL)
+                if plot_m:
+                    plot = plot_m.group(1).strip()
+                
+                if vol_name or chapters > 0:
+                    cn_nums = "一二三四五六七八九十"
+                    idx = len(volumes)
+                    cn_num = cn_nums[idx] if idx < len(cn_nums) else str(idx + 1)
+                    volumes.append({
+                        "name": f"第{cn_num}卷：{vol_name}" if vol_name else f"第{cn_num}卷",
+                        "chapters": chapters,
+                        "plot": plot or vol_name
+                    })
+            
+            if volumes:
+                logger.info(f"结构化格式解析成功，共 {len(volumes)} 卷")
+                # 校验和调整章节数
+                return self._adjust_volumes(volumes, total_chapters)
+        
+        # ---- 兜底：从自由文本中解析 ----
+        logger.info("未检测到 [卷]...[/卷] 结构化格式，尝试自由文本解析")
+        for line in volume_outline.split("\n"):
+            line_stripped = line.strip()
+            vol_m = re.search(r'第([一二三四五六七八九十\d]+)卷', line_stripped)
+            if not vol_m:
+                continue
+            
+            vol_num = vol_m.group(1)
+            rest = line_stripped[vol_m.end():].strip()
+            
+            # 提取章节范围（整行搜索）
+            range_m = re.search(r'(\d+)\s*[-–—]\s*(\d+)\s*章', line_stripped)
+            chapters = 0
+            if range_m:
+                chapters = int(range_m.group(2)) - int(range_m.group(1)) + 1
+            
+            # 提取卷名：去掉章节范围和标点
+            vol_name = rest
+            vol_name = re.sub(r'[（(]\s*\d+\s*[-–—]\s*\d+\s*章\s*[）)]', '', vol_name)
+            vol_name = re.sub(r'第?\s*\d+\s*[-–—]\s*\d+\s*章', '', vol_name)
+            vol_name = re.sub(r'^[：:，,、\s]+', '', vol_name).strip()
+            vol_name = re.sub(r'[：:，,、\s]+$', '', vol_name).strip()
+            
+            volumes.append({
+                "name": f"第{vol_num}卷：{vol_name}" if vol_name else f"第{vol_num}卷",
+                "chapters": chapters,
+                "plot": vol_name if vol_name else f"第{vol_num}卷"
+            })
+        
+        if not volumes:
+            logger.warning(f"自由文本解析也失败，AI原文前500字：{volume_outline[:500]}")
+            return []
+        
+        return self._adjust_volumes(volumes, total_chapters)
+    
+    def _adjust_volumes(self, volumes: list, total_chapters: int) -> list:
+        """校验和调整卷的章节数，确保总和接近 total_chapters"""
+        total_parsed = sum(v["chapters"] for v in volumes)
+        
+        # 所有卷都没有章节数，平均分配
+        if total_parsed == 0:
+            avg = max(1, total_chapters // len(volumes))
+            for v in volumes:
+                v["chapters"] = avg
+            total_parsed = sum(v["chapters"] for v in volumes)
+        
+        # 总章节数与预期差距大，按比例调整
+        if abs(total_parsed - total_chapters) > total_chapters * 0.3:
+            scale = total_chapters / total_parsed
+            for v in volumes:
+                v["chapters"] = max(1, round(v["chapters"] * scale))
+        
+        return volumes
     
     def generate_chapter(self, chapter_num: int, chapter_title: str, previous_summary: str = "", max_tokens: int = 2500, target_words: int = 2000) -> str:
         """生成单章正文 — 优化上下文：分类检索设定+前章，避免臃肿"""

@@ -618,16 +618,16 @@ def main():
                 st.session_state["mt_outline"] = mt_outline
             with mt_cols2[1]:
                 mt_chapter = st.number_input("📖 生成章节", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_chapter", 6000), step=500, key="mt_chapter_input")
+                    value=st.session_state.get("mt_chapter", 30000), step=500, key="mt_chapter_input")
                 st.session_state["mt_chapter"] = mt_chapter
             mt_cols3 = st.columns(2)
             with mt_cols3[0]:
                 mt_continue = st.number_input("✍️ 续写", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_continue", 6000), step=500, key="mt_continue_input")
+                    value=st.session_state.get("mt_continue", 30000), step=500, key="mt_continue_input")
                 st.session_state["mt_continue"] = mt_continue
             with mt_cols3[1]:
                 mt_polish = st.number_input("🎨 风格润色", min_value=500, max_value=80000,
-                    value=st.session_state.get("mt_polish", 6000), step=500, key="mt_polish_input")
+                    value=st.session_state.get("mt_polish", 30000), step=500, key="mt_polish_input")
                 st.session_state["mt_polish"] = mt_polish
             mt_cols4 = st.columns(2)
             with mt_cols4[0]:
@@ -1092,7 +1092,7 @@ def main():
         
         col1, col2 = st.columns(2)
         num_main = col1.number_input("主角人数", min_value=1, max_value=10, value=2)
-        num_support = col2.number_input("配角人数", min_value=1, max_value=20, value=5)
+        num_support = col2.number_input("配角人数", min_value=1, max_value=50, value=5)
         
         btn_label = "🔄 重新生成人物设定" if has_chars else "生成人物设定"
         if st.button(btn_label, type="primary", disabled=is_generating or not prereq_ok):
@@ -1164,7 +1164,7 @@ def main():
         with outline_cols[0]:
             total_chapters = st.text_input("总章节数规划", value="50", help="可输入具体数字如 50，或范围如 30-50")
         with outline_cols[1]:
-            words_per_chapter = st.number_input("每章大概字数", min_value=500, max_value=10000, value=2000, step=500, help="规划每章的大致字数，供AI参考")
+            words_per_chapter = st.number_input("每章大概字数", min_value=500, max_value=20000, value=2000, step=500, help="规划每章的大致字数，供AI参考")
         
         btn_label = "🔄 重新生成大纲" if has_outline else "生成大纲"
         if st.button(btn_label, type="primary", disabled=is_generating or not prereq_ok):
@@ -1271,7 +1271,7 @@ def main():
             chapter_title = input_cols[1].text_input("章节标题", placeholder="例如：初入都市", key="chap_title")
         
         # 章节目标字数设置
-        target_words = st.number_input("📝 目标字数", min_value=500, max_value=8000, value=2000, step=500,
+        target_words = st.number_input("📝 目标字数", min_value=500, max_value=20000, value=2000, step=500,
             help="期望AI生成的章节字数。注意：实际字数受 max_tokens 限制，建议 max_tokens ≥ 目标字数 × 1.5")
         
         # 检查此章节是否已存在
