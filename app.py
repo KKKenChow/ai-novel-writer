@@ -252,6 +252,12 @@ def load_from_vectorstore(workflow):
             # 原始文本和 prompt 恢复到 generated_content
             if key not in gc:
                 gc[key] = value
+        elif key == "outline_total_chapters":
+            if "outline_total_chapters" not in gc:
+                gc["outline_total_chapters"] = value
+        elif key == "outline_words_per_chapter":
+            if "outline_words_per_chapter" not in gc:
+                gc["outline_words_per_chapter"] = int(value) if value else 2000
         elif key == "consistency_result":
             if not st.session_state.get("consistency_result"):
                 st.session_state["consistency_result"] = value
@@ -267,6 +273,70 @@ def load_from_vectorstore(workflow):
         workflow.novel_info["characters"] = gc["characters"]
     if gc.get("outline"):
         workflow.novel_info["outline"] = gc["outline"]
+
+
+def _render_chapter_input(outline_titles: dict, key_suffix: str = ""):
+    """渲染章节号输入 + 大纲标题选择，返回 (chapter_num, chapter_title)
+    
+    outline_titles: {章节号: 标题} 字典（从大纲解析）
+    key_suffix: 用于 Streamlit key 的后缀，避免不同分支 key 冲突
+    """
+    chapter_num = st.number_input("章节号", min_value=1, max_value=1000, value=1, key=f"chap_num_{key_suffix}")
+    
+    if not outline_titles:
+        # 没有大纲标题可用，显示普通输入框
+        chapter_title = st.text_input("章节标题", placeholder="例如：初入都市", key=f"chap_title_{key_suffix}")
+        return chapter_num, chapter_title
+    
+    current_num = chapter_num
+    
+    if current_num in outline_titles:
+        # 当前章节号在大纲中有对应标题 — 显示 checkbox 快捷选择
+        title_from_outline = outline_titles[current_num]
+        use_outline = st.checkbox(f"📋 使用大纲标题「{title_from_outline}」", value=True, 
+                                  key=f"use_outline_{key_suffix}_{current_num}")
+        if use_outline:
+            st.markdown(f'<span style="color:#666;font-size:14px">已选择：{title_from_outline}</span>', unsafe_allow_html=True)
+            chapter_title = title_from_outline
+        else:
+            chapter_title = st.text_input("章节标题", value=title_from_outline, key=f"chap_title_{key_suffix}")
+    else:
+        # 当前章节号不在大纲中 — 显示下拉列表供选择任意大纲标题
+        title_options = ["✏️ 手动输入标题"] + [f"第{k}章：{v}" for k, v in sorted(outline_titles.items())]
+        selected_option = st.selectbox(
+            "📋 从大纲选择标题（可选）", options=title_options, 
+            key=f"outline_select_{key_suffix}",
+            help="可选择大纲中任意章节的标题作为参考，或选择手动输入"
+        )
+        if selected_option == "✏️ 手动输入标题":
+            chapter_title = st.text_input("章节标题", placeholder="例如：初入都市", key=f"chap_title_{key_suffix}")
+        else:
+            idx = title_options.index(selected_option) - 1
+            selected_num = sorted(outline_titles.keys())[idx]
+            chapter_title = outline_titles[selected_num]
+    
+    return chapter_num, chapter_title
+
+
+def _render_existing_chapter_title(old_title: str, outline_title: str | None, chapter_key: str):
+    """渲染已有章节的标题来源选择，返回最终选定的 chapter_title"""
+    title_options = [f"📝 保持当前标题：{old_title}"]
+    if outline_title and outline_title != old_title:
+        title_options.append(f"📋 改用大纲标题：{outline_title}")
+    title_options.append("✏️ 手动输入新标题")
+    
+    selected_option = st.selectbox(
+        "选择标题", options=title_options,
+        key=f"title_source_{chapter_key}",
+        help="可保留当前标题、改用大纲中的标题、或手动输入"
+    )
+    
+    if "保持当前标题" in selected_option:
+        return old_title
+    elif "大纲标题" in selected_option and outline_title:
+        return outline_title
+    else:
+        return st.text_input("手动输入标题", value=old_title, key=f"chap_title_{chapter_key}")
 
 # 检查前置步骤是否完成
 def check_prerequisite(step: str) -> bool:
@@ -366,9 +436,13 @@ def _clear_step_content(step: str, gc: dict, workflow=None):
         gc.pop("outline", None)
         gc.pop("outline_original", None)
         gc.pop("outline_prompt", None)
+        gc.pop("outline_total_chapters", None)
+        gc.pop("outline_words_per_chapter", None)
         if vs:
             vs.delete_extra_field("outline_original")
             vs.delete_extra_field("outline_prompt")
+            vs.delete_extra_field("outline_total_chapters")
+            vs.delete_extra_field("outline_words_per_chapter")
     elif step == "chapter":
         params = st.session_state.get("gen_params", {})
         chapter_num = f"{params.get('chapter_num', 1)}"
@@ -431,8 +505,12 @@ def execute_generation(workflow):
                 st.session_state.generated_content["characters"] = char_text
                 st.session_state.generated_content["characters_original"] = char_text
                 st.session_state.generated_content["characters_prompt"] = user_prompt
+                st.session_state.generated_content["characters_num_main"] = num_main
+                st.session_state.generated_content["characters_num_support"] = num_support
                 workflow.vs.save_extra_data("characters_original", char_text)
                 workflow.vs.save_extra_data("characters_prompt", user_prompt)
+                workflow.vs.save_extra_data("characters_num_main", str(num_main))
+                workflow.vs.save_extra_data("characters_num_support", str(num_support))
                 if is_ai_refusal(char_text):
                     error_msg = "AI拒绝了本次生成请求，请修改描述内容后重试（可能触发了内容安全审查）"
         
@@ -449,8 +527,13 @@ def execute_generation(workflow):
                 st.session_state.generated_content["outline"] = result
                 st.session_state.generated_content["outline_original"] = result
                 st.session_state.generated_content["outline_prompt"] = user_prompt
+                # 保存大纲生成参数，以便UI恢复
+                st.session_state.generated_content["outline_total_chapters"] = str(total_chapters)
+                st.session_state.generated_content["outline_words_per_chapter"] = int(words_per_chapter)
                 workflow.vs.save_extra_data("outline_original", result)
                 workflow.vs.save_extra_data("outline_prompt", user_prompt)
+                workflow.vs.save_extra_data("outline_total_chapters", str(total_chapters))
+                workflow.vs.save_extra_data("outline_words_per_chapter", str(int(words_per_chapter)))
                 if is_ai_refusal(result):
                     error_msg = "AI拒绝了本次生成请求，请修改描述内容后重试（可能触发了内容安全审查）"
         
@@ -1108,9 +1191,12 @@ def main():
             height=80,
             key="char_prompt")
         
+        # 恢复上次生成时使用的参数值
+        saved_num_main = st.session_state.generated_content.get("characters_num_main", 2)
+        saved_num_support = st.session_state.generated_content.get("characters_num_support", 5)
         col1, col2 = st.columns(2)
-        num_main = col1.number_input("主角人数", min_value=1, max_value=10, value=2)
-        num_support = col2.number_input("配角人数", min_value=1, max_value=50, value=5)
+        num_main = col1.number_input("主角人数", min_value=1, max_value=10, value=int(saved_num_main))
+        num_support = col2.number_input("配角人数", min_value=1, max_value=50, value=int(saved_num_support))
         
         btn_label = "🔄 重新生成人物设定" if has_chars else "生成人物设定"
         if st.button(btn_label, type="primary", disabled=is_generating or not prereq_ok):
@@ -1126,9 +1212,13 @@ def main():
                 st.session_state.generated_content.pop("characters", None)
                 st.session_state.generated_content.pop("characters_original", None)
                 st.session_state.generated_content.pop("characters_prompt", None)
+                st.session_state.generated_content.pop("characters_num_main", None)
+                st.session_state.generated_content.pop("characters_num_support", None)
                 workflow.vs.delete_section("character", "all_characters")
                 workflow.vs.delete_extra_field("characters_original")
                 workflow.vs.delete_extra_field("characters_prompt")
+                workflow.vs.delete_extra_field("characters_num_main")
+                workflow.vs.delete_extra_field("characters_num_support")
                 workflow.novel_info.pop("characters", None)
                 st.rerun()
         
@@ -1179,11 +1269,14 @@ def main():
             placeholder="例如：主角从底层开始，一路成长，最终都市封神...",
             height=80,
             key="outline_prompt")
+        # 恢复上次生成时使用的参数值
+        saved_total_chapters = st.session_state.generated_content.get("outline_total_chapters", "50")
+        saved_words_per_chapter = st.session_state.generated_content.get("outline_words_per_chapter", 2000)
         outline_cols = st.columns(2)
         with outline_cols[0]:
-            total_chapters = st.text_input("总章节数规划", value="50", help="可输入具体数字如 50，或范围如 30-50")
+            total_chapters = st.text_input("总章节数规划", value=saved_total_chapters, help="可输入具体数字如 50，或范围如 30-50")
         with outline_cols[1]:
-            words_per_chapter = st.number_input("每章大概字数", min_value=500, max_value=20000, value=2000, step=500, help="规划每章的大致字数，供AI参考")
+            words_per_chapter = st.number_input("每章大概字数", min_value=500, max_value=20000, value=int(saved_words_per_chapter), step=500, help="规划每章的大致字数，供AI参考")
         
         btn_label = "🔄 重新生成大纲" if has_outline else "生成大纲"
         if st.button(btn_label, type="primary", disabled=is_generating or not prereq_ok):
@@ -1209,9 +1302,13 @@ def main():
                 st.session_state.generated_content.pop("outline", None)
                 st.session_state.generated_content.pop("outline_original", None)
                 st.session_state.generated_content.pop("outline_prompt", None)
+                st.session_state.generated_content.pop("outline_total_chapters", None)
+                st.session_state.generated_content.pop("outline_words_per_chapter", None)
                 workflow.vs.delete_section("outline", "full_outline")
                 workflow.vs.delete_extra_field("outline_original")
                 workflow.vs.delete_extra_field("outline_prompt")
+                workflow.vs.delete_extra_field("outline_total_chapters")
+                workflow.vs.delete_extra_field("outline_words_per_chapter")
                 workflow.novel_info.pop("outline", None)
                 st.rerun()
         
@@ -1266,29 +1363,249 @@ def main():
         
         existing_chapters = st.session_state.generated_content.get("chapters", {})
         
-        # 选择章节：已有章节可快速选择，也可手动输入新章节号
+        # 从 session_state 直接获取大纲文本（不依赖 novel_info 同步）
+        outline_text = st.session_state.generated_content.get("outline", "")
+        if outline_text and (not workflow.novel_info.get("outline") or workflow.novel_info.get("outline") != outline_text):
+            workflow.novel_info["outline"] = outline_text
+        # 解析大纲中的章节标题
+        outline_titles = workflow.get_outline_chapter_titles() if outline_text else {}
+        
+        # ===== 新增：章节管理面板（含选中切换、单章/批量删除） =====
+        sorted_keys = sorted(existing_chapters.keys(), key=lambda x: int(x) if x.isdigit() else 0) if existing_chapters else []
+        
+        # 确保活跃章节变量存在
+        if "active_chapter_key" not in st.session_state:
+            st.session_state.active_chapter_key = sorted_keys[0] if sorted_keys else None
+        
         if existing_chapters:
-            sorted_keys = sorted(existing_chapters.keys(), key=lambda x: int(x))
-            chapter_options = ["✏️ 手动输入新章节号"] + [f"第{k}章 {existing_chapters[k]['title']}" for k in sorted_keys]
-            selected_chapter = st.selectbox("选择章节", options=chapter_options, key="chapter_select")
+            # 统计信息
+            total_words = sum(len(existing_chapters[k].get("content", "")) for k in sorted_keys)
+            total_count = len(sorted_keys)
+            
+            # 大纲总规划（如果有）
+            planned_total = st.session_state.generated_content.get("outline_total_chapters", "")
+            planned_label = f" / 规划{planned_total}章" if planned_total and planned_total.isdigit() else ""
+            
+            # 面板工具栏：批量操作区
+            panel_col1, panel_col2, panel_col3, panel_col4 = st.columns([2, 1, 1, 1])
+            with panel_col1:
+                st.markdown(f"""### 📚 章节管理面板
+<span style="font-size:14px;color:#888;">共 <b>{total_count}</b> 章 · {total_words:,} 字{planned_label}</span>""",
+                    unsafe_allow_html=True)
+            with panel_col2:
+                batch_mode = st.checkbox("🗑️ 批量选择", key="chapter_batch_mode", help="开启后可多选章节进行批量删除")
+            with panel_col3:
+                if batch_mode:
+                    batch_delete_clicked = st.button(
+                        "🗑️ 删除所选", type="secondary",
+                        disabled=not st.session_state.get("chapters_to_delete", []),
+                        help="删除所有勾选的章节"
+                    )
+                else:
+                    batch_delete_clicked = False
+            with panel_col4:
+                if batch_mode and st.session_state.get("chapters_to_delete"):
+                    selected_count = len(st.session_state["chapters_to_delete"])
+                    st.markdown(f"<span style='color:#ef5350;font-size:13px;'>已选 {selected_count} 章</span>", unsafe_allow_html=True)
+            
+            # 执行批量删除
+            if batch_mode and batch_delete_clicked and st.session_state.get("chapters_to_delete"):
+                to_delete = list(st.session_state["chapters_to_delete"])
+                delete_names = [f"第{k}章「{existing_chapters[k]['title']}」" for k in to_delete]
+                
+                # 清理向量库
+                for dk in to_delete:
+                    workflow.vs.delete_section("chapter", f"chapter_{dk}")
+                # 从生成内容中移除
+                for dk in to_delete:
+                    del st.session_state.generated_content["chapters"][dk]
+                # 重置选择状态
+                st.session_state.chapters_to_delete = []
+                remaining_keys = sorted(st.session_state.generated_content.get("chapters", {}).keys(), 
+                                       key=lambda x: int(x) if x.isdigit() else 0)
+                st.session_state.active_chapter_key = remaining_keys[-1] if remaining_keys else None
+                st.success(f"✅ 已删除 {len(to_delete)} 章：{'、'.join(delete_names)}")
+                st.rerun()
+            
+            # 卡片网格区：用 expander 包裹，章节多时可折叠收起（工具栏始终可见）
+            CARDS_PER_PAGE = 10   # 每页显示的卡片数上限
+            panel_expanded = total_count <= CARDS_PER_PAGE * 3  # 章节多时默认折叠
+            
+            with st.expander(
+                f"📑 章节列表 ({total_count} 章)",
+                expanded=panel_expanded
+            ):
+                # 章节卡片网格：支持分页
+                cols_per_row = 5
+            
+                # 分页逻辑：章节超过阈值时才分页
+                use_pagination = total_count > CARDS_PER_PAGE
+                if "chapter_page" not in st.session_state:
+                    st.session_state.chapter_page = 0
+                
+                # 计算当前页的数据范围
+                if use_pagination:
+                    total_pages = max(1, (total_count + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+                    # 如果当前页超出范围（比如删了章节），重置到最后一页
+                    if st.session_state.chapter_page >= total_pages:
+                        st.session_state.chapter_page = total_pages - 1
+                    
+                    page_start = st.session_state.chapter_page * CARDS_PER_PAGE
+                    page_end = min(page_start + CARDS_PER_PAGE, total_count)
+                    page_keys = sorted_keys[page_start:page_end]
+                    
+                    # 分页控制器栏
+                    pg_col1, pg_col2, pg_col3, pg_col4, pg_col5 = st.columns([2, 1, 1, 1, 2])
+                    with pg_col1:
+                        st.caption(f"📄 第 {st.session_state.chapter_page + 1}/{total_pages} 页 · 显示第 {page_start + 1}-{page_end} 章")
+                    with pg_col2:
+                        if st.button("⬅️ 上一页", key="chap_pg_prev", disabled=st.session_state.chapter_page <= 0):
+                            st.session_state.chapter_page -= 1
+                            st.rerun()
+                    with pg_col3:
+                        if st.button("➡️ 下一页", key="chap_pg_next", disabled=st.session_state.chapter_page >= total_pages - 1):
+                            st.session_state.chapter_page += 1
+                            st.rerun()
+                    with pg_col4:
+                        # 快速跳转选择
+                        jump_page = st.selectbox(
+                            "跳转到",
+                            options=list(range(1, total_pages + 1)),
+                            index=st.session_state.chapter_page,
+                            format_func=lambda p: f"第{p}页",
+                            key="chap_jump_page",
+                            label_visibility="collapsed",
+                        )
+                        if jump_page - 1 != st.session_state.chapter_page:
+                            st.session_state.chapter_page = jump_page - 1
+                            st.rerun()
+                    with pg_col5:
+                        # 每页容量选项
+                        new_pp = st.radio(
+                            "每页", options=[10, 15, 20, 50], horizontal=True,
+                            index=0, key="cards_per_page_opt", label_visibility="collapsed",
+                            caption="卡片数量"
+                        )
+                else:
+                    page_keys = sorted_keys
+                    page_start = 0
+                    page_end = total_count
+                
+                # 分批渲染当前页的卡片，每批一行（Streamlit columns 不能跨批次复用）
+                for batch_start in range(0, len(page_keys), cols_per_row):
+                    batch_keys = page_keys[batch_start:batch_start + cols_per_row]
+                    card_cols = st.columns(len(batch_keys))
+                    
+                    for col_idx, chap_key in enumerate(batch_keys):
+                        chap = existing_chapters[chap_key]
+                        title = chap.get("title", "未命名")
+                        content_len = len(chap.get("content", ""))
+                        
+                        # 卡片样式：根据字数和状态着色
+                        if content_len >= 1500:
+                            status_color = "#1b5e20"; status_icon = "✅"
+                            bg_color = "#0d2818"; border_color = "#2e7d32"
+                        elif content_len >= 500:
+                            status_color = "#e65100"; status_icon = "⚠️"
+                            bg_color = "#281a0d"; border_color = "#ef6c00"
+                        else:
+                            status_color = "#b71c1c"; status_icon = "❗"
+                            bg_color = "#280d1a"; border_color = "#c62828"
+                        
+                        # 是否为当前激活的章节
+                        is_active = (st.session_state.active_chapter_key == chap_key)
+                        active_border = "3px solid #42a5f5" if is_active else ""
+                        
+                        with card_cols[col_idx]:
+                            if batch_mode:
+                                # 批量模式：显示 checkbox
+                                checked = st.checkbox(
+                                    f"{status_icon} 第{chap_key}章 *{title[:10]}{'...' if len(title)>10 else ''}* `{content_len}字`",
+                                    key=f"batch_chk_{chap_key}",
+                                    value=chap_key in st.session_state.get("chapters_to_delete", set()),
+                                    label_visibility="visible"
+                                )
+                                # 同步到待删除集合
+                                if "chapters_to_delete" not in st.session_state:
+                                    st.session_state.chapters_to_delete = set()
+                                if checked:
+                                    st.session_state.chapters_to_delete.add(chap_key)
+                                elif chap_key in st.session_state.chapters_to_delete:
+                                    st.session_state.chapters_to_delete.discard(chap_key)
+                            else:
+                                # 普通模式：可点击的章节卡片 + 单独删除按钮
+                                c_top, c_del = st.columns([5, 1])
+                                with c_top:
+                                    clicked = st.button(
+                                        f"{status_icon} **第{chap_key}章**\n*{title[:12]}{'...' if len(title)>12 else ''}*  \n`{content_len}字`",
+                                        key=f"chap_card_{chap_key}",
+                                        help=f"第{chap_key}章「{title}」— 点击切换到此章",
+                                        use_container_width=True,
+                                    )
+                                    if clicked:
+                                        st.session_state.active_chapter_key = chap_key
+                                        st.rerun()
+                                
+                                with c_del:
+                                    # 小删除按钮
+                                    if st.button("🗑️", key=f"chap_del_{chap_key}", 
+                                               help=f"删除第{chap_key}章「{title}」"):
+                                        # 向量库清理
+                                        workflow.vs.delete_section("chapter", f"chapter_{chap_key}")
+                                        # 内容清理
+                                        del st.session_state.generated_content["chapters"][chap_key]
+                                        
+                                        # 激活键迁移：删的是当前激活的，则切到相邻章节
+                                        if st.session_state.active_chapter_key == chap_key:
+                                            remaining = [k for k in sorted_keys if k != chap_key]
+                                            st.session_state.active_chapter_key = remaining[-1] if remaining else None
+                                        
+                                        st.success(f"🗑️ 已删除第{chap_key}章「{title}」")
+                                        st.rerun()
+            
+            st.divider()
+        
+        # ===== 选择/新建章节（与面板联动） =====
+        if existing_chapters:
+            chapter_options = ["✏️ 手动输入新章节号"] + [
+                f"第{k}章 {existing_chapters[k]['title']}" for k in sorted_keys
+            ]
+            
+            # selectbox 的默认 index 与 active_chapter_key 联动
+            active_key = st.session_state.get("active_chapter_key")
+            try:
+                default_idx = (sorted_keys.index(active_key) + 1) if (active_key and active_key in sorted_keys) else 0
+            except ValueError:
+                default_idx = 0
+            
+            selected_chapter = st.selectbox(
+                "选择或新建章节",
+                options=chapter_options,
+                key="chapter_select",
+                index=default_idx,
+            )
+            
+            # selectbox 变化时也同步回 active_chapter_key
+            if selected_chapter != "✏️ 手动输入新章节号":
+                idx = chapter_options.index(selected_chapter) - 1
+                if 0 <= idx < len(sorted_keys):
+                    selectbox_key = sorted_keys[idx]
+                    if st.session_state.get("active_chapter_key") != selectbox_key:
+                        st.session_state.active_chapter_key = selectbox_key
             
             if selected_chapter == "✏️ 手动输入新章节号":
-                # 手动输入模式
-                input_cols = st.columns(2)
-                chapter_num = input_cols[0].number_input("章节号", min_value=1, max_value=1000, value=1, key="chap_num")
-                chapter_title = input_cols[1].text_input("章节标题", placeholder="例如：初入都市", key="chap_title")
+                chapter_num, chapter_title = _render_chapter_input(outline_titles, key_suffix="new")
             else:
-                # 选择了已有章节
                 idx = chapter_options.index(selected_chapter) - 1
                 selected_key = sorted_keys[idx]
                 chapter_num = int(selected_key)
-                chapter_title = existing_chapters[selected_key]["title"]
-                st.info(f"📖 已选择第{selected_key}章「{chapter_title}」— 可在下方编辑或重新生成")
+                old_title = existing_chapters[selected_key]["title"]
+                outline_title = outline_titles.get(chapter_num, None)
+                chapter_title = _render_existing_chapter_title(old_title, outline_title, selected_key)
+                st.info(f"📖 已选择第{selected_key}章「{old_title}」— 可修改标题或在下方重新生成")
         else:
-            # 没有已有章节，直接输入
-            input_cols = st.columns(2)
-            chapter_num = input_cols[0].number_input("章节号", min_value=1, max_value=1000, value=1, key="chap_num")
-            chapter_title = input_cols[1].text_input("章节标题", placeholder="例如：初入都市", key="chap_title")
+            # 没有已有章节
+            chapter_num, chapter_title = _render_chapter_input(outline_titles, key_suffix="fresh")
         
         # 章节目标字数设置
         target_words = st.number_input("📝 目标字数", min_value=500, max_value=20000, value=2000, step=500,
