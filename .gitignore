@@ -1,6 +1,9 @@
 # 环境变量（包含API Key等敏感信息）
 .env
 
+# 用户配置（包含API Key等敏感信息，所有个人隐私配置统一存放于此）
+user_config.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -13,8 +16,11 @@ venv/
 .venv/
 env/
 
-# 向量数据库（包含创作内容，不应提交）
+# 向量数据库（旧版遗留，已弃用，可用 scripts/migrate_from_chromadb.py 迁移后删除）
 chroma_db/
+
+# 小说数据（JSON 存储，包含创作内容，不应提交）
+novels_data/
 
 # 导出的小说文件
 output/
