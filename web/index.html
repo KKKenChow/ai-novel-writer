@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI小说创作</title>
-<link rel="stylesheet" href="/style.css?v=5">
+<link rel="stylesheet" href="/style.css?v=9">
 </head>
 <body>
 <div id="app">
@@ -48,10 +48,17 @@
     <div id="gen-stage" class="hidden"></div>
     <div id="gen-status">正在生成中…</div>
     <div id="gen-meta" class="hidden"></div>
+    <div id="gen-elapsed" class="hidden">已耗时 0 秒</div>
+    <div id="gen-error" class="hidden"></div>
+    <pre id="gen-reasoning" class="hidden"></pre>
     <pre id="gen-stream" class="hidden"></pre>
+    <div class="row" style="justify-content:center;margin-top:14px;gap:8px">
+      <button id="gen-cancel">⏹ 取消生成</button>
+      <button id="gen-close" class="hidden">关闭</button>
+    </div>
   </div>
 </div>
 
-<script src="/app.js?v=6"></script>
+<script src="/app.js?v=13"></script>
 </body>
 </html>

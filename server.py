@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import uuid
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,13 +20,14 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Optional
 
-from api.api_client import LLMAPIClient
+from api.api_client import LLMAPIClient, GenerationCancelled
 from api import user_config
 from skills import skill_manager
 from storage.json_store import JsonNovelStore
 from storage import exporters
-from workflow.novel_workflow import FullNovelWorkflow, is_ai_refusal
+from workflow.novel_workflow import FullNovelWorkflow, is_ai_refusal, ChapterPaused
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -56,18 +58,31 @@ _client_lock = threading.Lock()
 _client_cache = {"key": None, "client": None}
 
 
-def get_client() -> LLMAPIClient:
+def _build_client(provider: dict) -> LLMAPIClient:
+    return LLMAPIClient(
+        api_key=provider["api_key"],
+        api_base=provider.get("api_base") or None,
+        model=provider.get("model") or "doubao-pro-32k",
+        max_output=provider.get("max_output") or None,
+        reasoning_effort=provider.get("reasoning_effort") or None,
+        thinking_disabled=bool(provider.get("thinking_disabled")),
+    )
+
+
+def get_client(fresh: bool = False) -> LLMAPIClient:
+    """获取 API 客户端。fresh=True 时创建独立实例（生成任务用，
+    避免并发任务共享单例导致取消标志/截断状态互相覆盖）。"""
     provider = user_config.get_active_provider()
     if not provider or not provider.get("api_key"):
         raise HTTPException(400, "尚未配置模型 API Key，请先在侧边栏「模型配置」中添加")
-    key = (provider.get("api_key"), provider.get("api_base"), provider.get("model"))
+    if fresh:
+        return _build_client(provider)
+    key = (provider.get("api_key"), provider.get("api_base"), provider.get("model"),
+           provider.get("max_output"), provider.get("reasoning_effort"),
+           provider.get("thinking_disabled"))
     with _client_lock:
         if _client_cache["key"] != key:
-            _client_cache["client"] = LLMAPIClient(
-                api_key=provider["api_key"],
-                api_base=provider.get("api_base") or None,
-                model=provider.get("model") or "doubao-pro-32k",
-            )
+            _client_cache["client"] = _build_client(provider)
             _client_cache["key"] = key
         return _client_cache["client"]
 
@@ -76,9 +91,9 @@ def get_store(novel_id: str) -> JsonNovelStore:
     return JsonNovelStore(db_path=DATA_DIR, novel_id=novel_id)
 
 
-def get_workflow(novel_id: str) -> FullNovelWorkflow:
+def get_workflow(novel_id: str, fresh_client: bool = False) -> FullNovelWorkflow:
     """构建 workflow 并从存储同步 novel_info（等价于原 init_app + load_from_vectorstore）"""
-    client = get_client()
+    client = get_client(fresh=fresh_client)
     store = get_store(novel_id)
     workflow = FullNovelWorkflow(client, store)
     client.skill_provider = lambda prompt, step: skill_manager.inject_skills(
@@ -137,18 +152,66 @@ def _task_emit(task_id: str, event: str, data):
             task["queue"].put((event, data))
 
 
+def _task_confirm(task_id: str, msg: str, options: list):
+    """emit need_confirm 并阻塞等待用户响应（POST /api/tasks/{id}/respond）。
+    无时间上限；但前端 SSE 断开（关页面/断网）或任务被清理时返回 None，
+    由调用方按「安全暂停」处理，避免线程无限阻塞 / 无人值守反复重试烧 token。"""
+    ev = threading.Event()
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return None
+        task["confirm_event"] = ev
+        task["confirm_result"] = None
+    try:
+        _task_emit(task_id, "need_confirm", {"msg": msg, "options": options})
+        while True:
+            if ev.wait(timeout=10):
+                with TASKS_LOCK:
+                    t = TASKS.get(task_id) or {}
+                    return t.get("confirm_result")
+            # 每 10s 做一次存活检查：前端断开则放弃等待（进度已落盘，可下次继续）
+            with TASKS_LOCK:
+                t = TASKS.get(task_id)
+                if not t or t.get("client_disconnected"):
+                    return None
+    finally:
+        with TASKS_LOCK:
+            t = TASKS.get(task_id)
+            if t:
+                t.pop("confirm_event", None)
+                t.pop("confirm_result", None)
+
+
 def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
     """在线程池中执行生成任务，通过队列推送 progress/token 事件，最后推送 done/error"""
     emit = lambda e, d: _task_emit(task_id, e, d)
     try:
-        workflow = get_workflow(novel_id)
+        workflow = get_workflow(novel_id, fresh_client=True)
+        client = workflow.api
+        # 记录任务使用的配置快照，便于排查"以为在用 A 模型其实在用 B"
+        provider = user_config.get_active_provider() or {}
+        logger.info(f"任务开始 → provider={provider.get('name', '?')}, model={client.model}, step={step}")
+        with TASKS_LOCK:
+            t = TASKS.get(task_id)
+            if t is not None:
+                t["client"] = client
+                t["model"] = client.model
+        # 取消检查：任务被标记 cancelled 时，API 层在 chunk 级/请求前中断
+        client.cancel_check = lambda: TASKS.get(task_id, {}).get("cancelled", False)
         # progress 事件 payload 统一为对象 {msg, stage?, stage_total?, phase?}，兼容纯文本回调
         workflow.on_progress = lambda msg, **fields: emit("progress", {"msg": msg, **fields})
         # 黄金开篇会生成两个版本，逐字流会造成两个版本文本混在一起，只用进度提示
         if step != "golden_chapter":
             workflow.on_token = lambda tok: emit("token", tok)
+            workflow.on_reasoning = lambda tok: emit("reasoning", tok)
+        # 用户决策回调：emit need_confirm 后阻塞等待 /respond，前端断开则安全暂停
+        workflow.on_confirm = lambda msg, options: _task_confirm(task_id, msg, options)
         vs = workflow.vs
-        mt = int(params.get("max_tokens") or DEFAULT_MAX_TOKENS.get(step, 4000))
+        # max_tokens 优先级：本次请求参数 > 用户全局覆盖表 > 内置默认值
+        mt = int(params.get("max_tokens") or
+                 user_config.get_max_tokens_overrides().get(step) or
+                 DEFAULT_MAX_TOKENS.get(step, 4000))
         result_payload = {}
         warning = ""
 
@@ -445,7 +508,21 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
 
         if warning:
             result_payload["warning"] = warning
+        # 截断/思考参数未生效的告警（最后一次调用的状态；多次调用时以最后为准，聊胜于无）
+        if getattr(client, "last_finish_reason", None) == "length":
+            trunc_warn = "⚠️ 输出达到 token 上限被截断（finish_reason=length），建议调大该步骤 max_tokens"
+            result_payload["warning"] = (result_payload.get("warning", "") + "；" + trunc_warn).strip("；")
+        if getattr(client, "thinking_disable_ignored", False):
+            td_warn = "⚠️ 已请求关闭思考，但模型仍在输出思考内容——该服务商可能不支持 thinking 参数"
+            result_payload["warning"] = (result_payload.get("warning", "") + "；" + td_warn).strip("；")
         emit("done", result_payload)
+    except ChapterPaused as e:
+        # 用户暂停/取消：进度已保存，不加"已有内容保持不变"后缀
+        logger.info(f"任务 {task_id} 已暂停: {e}")
+        emit("error", str(e))
+    except GenerationCancelled as e:
+        logger.info(f"任务 {task_id} 已被用户取消: {e}")
+        emit("error", f"⏹ 已取消：{e}")
     except Exception as e:
         logger.exception(f"任务 {task_id} 失败")
         emit("error", f"{str(e)}（已有内容保持不变）")
@@ -488,21 +565,73 @@ def task_stream(task_id: str):
     if not task:
         raise HTTPException(404, "任务不存在或已过期")
     q = task["queue"]
+    with TASKS_LOCK:
+        # 新连接建立（含浏览器自动重连），清除断开标记
+        if task_id in TASKS:
+            TASKS[task_id]["client_disconnected"] = False
 
-    def event_source():
-        while True:
-            try:
-                event, data = q.get(timeout=30)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if event == "__end__":
-                break
-            yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    async def event_source():
+        # 异步生成器：客户端断开时 uvicorn 会取消协程，finally 一定执行
+        # （同步生成器跑在线程池里，断开时无法可靠感知）
+        try:
+            while True:
+                try:
+                    event, data = await asyncio.to_thread(q.get, True, 30)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if event == "__end__":
+                    break
+                yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        finally:
+            # 客户端断开（关页面/断网/浏览器重连前）→ 标记，_task_confirm 据此放弃等待
+            with TASKS_LOCK:
+                t = TASKS.get(task_id)
+                if t and not t.get("finished_at"):
+                    t["client_disconnected"] = True
+                    # 刷新/关闭页面≠取消：任务与 token 消耗仍在后台继续
+                    logger.warning(f"任务 {task_id}（{t.get('step', '?')}）前端已断开，"
+                                   f"任务仍在后台执行，token 继续消耗；"
+                                   f"如需停止请重新打开页面后使用取消功能")
 
     return StreamingResponse(event_source(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(task_id: str):
+    """用户手动取消任务：置 cancelled 标志并强断进行中的 HTTP 连接。
+    已落盘的断点进度保留；注意刷新/关闭页面不会触发本接口（任务在后台继续）。"""
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task or task.get("finished_at"):
+            raise HTTPException(404, "任务不存在或已结束")
+        task["cancelled"] = True
+        client = task.get("client")
+        # 若有正在等待用户决策的确认框，用 resume_later 解除阻塞，让任务线程走到取消检查点
+        ev = task.get("confirm_event")
+        if ev is not None:
+            task["confirm_result"] = "resume_later"
+    if client is not None:
+        client.cancel()  # 强断阻塞中的请求，流式/非流式都会立即抛错
+    if ev is not None:
+        ev.set()
+    logger.info(f"任务 {task_id} 收到取消请求")
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/respond")
+def respond_task(task_id: str, body: dict):
+    """用户对 need_confirm 事件做出决策：{"action": "retry"|"resume_later"|"cancel"|...}"""
+    action = (body.get("action") or "").strip()
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task or "confirm_event" not in task:
+            raise HTTPException(404, "任务不存在或没有待响应的确认")
+        task["confirm_result"] = action
+        task["confirm_event"].set()
+    return {"ok": True}
 
 
 # ---------- 模型配置 ----------
@@ -512,6 +641,9 @@ class ProviderIn(BaseModel):
     api_key: str = ""
     api_base: str = ""
     model: str = ""
+    max_output: Optional[int] = None           # 单次输出 token 上限（查服务商文档填写）
+    reasoning_effort: Optional[str] = None     # 思考强度：low/medium/high，空 = 不传参
+    thinking_disabled: Optional[bool] = None   # 关闭思考（注入 thinking.type=disabled）
 
 
 @app.get("/api/providers")
@@ -525,7 +657,14 @@ def list_providers():
 def upsert_provider(p: ProviderIn):
     if not p.name.strip():
         raise HTTPException(400, "配置名称不能为空")
-    user_config.upsert_provider(p.dict())
+    data = {k: v for k, v in p.dict().items() if v not in (None, "")}
+    data["name"] = p.name  # name 必保留
+    # 保留探测得到的能力信息（reasoning / reasoning_effort_options / thinking_disable），表单不提交这些字段
+    old = user_config.get_provider(p.name) or {}
+    for k in ("reasoning", "reasoning_effort_options", "thinking_disable"):
+        if k in old and k not in data:
+            data[k] = old[k]
+    user_config.upsert_provider(data)
     user_config.set_active_provider(p.name)
     with _client_lock:
         _client_cache["key"] = None
@@ -537,7 +676,11 @@ def set_active_provider(body: dict):
     user_config.set_active_provider(body.get("name", ""))
     with _client_lock:
         _client_cache["key"] = None
-    return {"ok": True}
+    # 切换不影响正在运行的任务（它们持有旧 client 直到完成）；返回数量供前端提示
+    with TASKS_LOCK:
+        running = [t for t in TASKS.values() if not t.get("finished_at")]
+    return {"ok": True, "running_tasks": len(running),
+            "running_models": sorted({t.get("model", "?") for t in running})}
 
 
 @app.delete("/api/providers/{name}")
@@ -551,9 +694,26 @@ def delete_provider(name: str):
 @app.post("/api/providers/test")
 def test_provider(p: ProviderIn):
     client = LLMAPIClient(api_key=p.api_key, api_base=p.api_base or None,
-                          model=p.model or "doubao-pro-32k")
-    ok, msg, latency = client.test_connection()
-    return {"ok": ok, "msg": msg, "latency": round(latency)}
+                          model=p.model or "doubao-pro-32k",
+                          max_output=p.max_output or None)
+    ok, msg, latency, caps = client.test_connection()
+    # 探测成功 → 把能力信息写回已有同名配置（reasoning / 支持的思考强度档位）
+    if ok and p.name and user_config.get_provider(p.name):
+        fields = {"reasoning": caps.get("reasoning", False),
+                  "thinking_disable": bool(caps.get("thinking_disable"))}
+        if caps.get("reasoning_effort_options"):
+            fields["reasoning_effort_options"] = caps["reasoning_effort_options"]
+            # 当前所选强度不在支持列表中 → 清空，避免发送无效参数
+            cur = (user_config.get_provider(p.name) or {}).get("reasoning_effort")
+            if cur and cur not in caps["reasoning_effort_options"]:
+                fields["reasoning_effort"] = None
+        else:
+            fields["reasoning_effort_options"] = None
+            fields["reasoning_effort"] = None
+        user_config.update_provider_fields(p.name, fields)
+        with _client_lock:
+            _client_cache["key"] = None
+    return {"ok": ok, "msg": msg, "latency": round(latency), "caps": caps}
 
 
 @app.get("/api/usage")
@@ -566,6 +726,29 @@ def get_usage():
     return {"session": session, "cumulative": user_config.get_cumulative_usage(),
             "by_model": user_config.get_usage_by_model(),
              "skill_inject_chars": skill_manager.get_inject_max_chars()}
+
+
+# ---------- 每步 max_tokens 覆盖设置 ----------
+
+# 覆盖表中额外暴露的非 DEFAULT_MAX_TOKENS 步骤（内部计算、不在请求参数里的）
+EXTRA_TOKEN_STEPS = {
+    "chapter_scene": "章节·每场景（按场景卡分段生成时单次调用，推理模型需调大）",
+}
+
+
+@app.get("/api/settings/max-tokens")
+def get_max_tokens_settings():
+    return {"defaults": DEFAULT_MAX_TOKENS,
+            "extra_steps": EXTRA_TOKEN_STEPS,
+            "overrides": user_config.get_max_tokens_overrides()}
+
+
+@app.post("/api/settings/max-tokens")
+def set_max_tokens_settings(body: dict):
+    allowed = set(DEFAULT_MAX_TOKENS) | set(EXTRA_TOKEN_STEPS)
+    overrides = {k: v for k, v in (body.get("overrides") or {}).items() if k in allowed}
+    user_config.set_max_tokens_overrides(overrides)
+    return {"ok": True, "overrides": user_config.get_max_tokens_overrides()}
 
 
 @app.post("/api/usage/clear")
@@ -598,6 +781,24 @@ def create_novel(body: dict):
     novel_id = f"novel_{int(time.time() * 1000)}"
     JsonNovelStore(db_path=DATA_DIR, novel_id=novel_id, novel_name=name)
     return {"id": novel_id, "name": name}
+
+
+@app.get("/api/novels/{novel_id}/chapter-partials")
+def list_chapter_partials(novel_id: str):
+    """列出该小说所有未完成的章节断点（按场景生成的中途进度）"""
+    store = get_store(novel_id)
+    extra = store.load_extra_data() or {}
+    partials = []
+    for k, v in extra.items():
+        if k.startswith("chapter_partial_") and isinstance(v, dict):
+            try:
+                num = int(k.rsplit("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            total = len(FullNovelWorkflow.parse_beats(v.get("beats_text", "")) or [])
+            partials.append({"chapter_num": num, "title": v.get("title", ""),
+                             "done_scenes": len(v.get("parts") or []), "total_scenes": total})
+    return {"partials": sorted(partials, key=lambda x: x["chapter_num"])}
 
 
 @app.get("/api/novels/{novel_id}")

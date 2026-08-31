@@ -66,19 +66,53 @@ function runGeneration(step, params, { onToken, onDone, onError, streamTarget } 
   const overlay = $("#gen-overlay");
   const statusEl = $("#gen-status");
   const streamEl = $("#gen-stream");
+  const reasoningEl = $("#gen-reasoning");
   const stageEl = $("#gen-stage");
   const metaEl = $("#gen-meta");
+  const elapsedEl = $("#gen-elapsed");
+  const errorEl = $("#gen-error");
+  const closeBtn = $("#gen-close");
+  const cancelBtn = $("#gen-cancel");
+  const spinnerEl = overlay.querySelector(".spinner");
   statusEl.textContent = `正在生成：${STEP_NAMES[step] || step}…`;
   stageEl.classList.add("hidden");
   metaEl.classList.add("hidden");
   streamEl.textContent = "";
   streamEl.classList.toggle("hidden", !streamTarget && !onToken);
+  reasoningEl.textContent = "";
+  reasoningEl.classList.add("hidden");
+  // 错误反馈与关闭按钮初始化为隐藏，spinner 恢复显示
+  errorEl.classList.add("hidden");
+  errorEl.textContent = "";
+  closeBtn.classList.add("hidden");
+  spinnerEl.classList.remove("hidden");
+  // 取消按钮：生成期间常显
+  cancelBtn.classList.remove("hidden");
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = "⏹ 取消生成";
   overlay.classList.remove("hidden");
+  // 耗时计时
+  const startTs = Date.now();
+  const fmtElapsed = () => {
+    const sec = Math.floor((Date.now() - startTs) / 1000);
+    return sec < 60 ? `已耗时 ${sec} 秒` : `已耗时 ${Math.floor(sec / 60)} 分 ${sec % 60} 秒`;
+  };
+  elapsedEl.textContent = fmtElapsed();
+  elapsedEl.classList.remove("hidden");
+  const elapsedTimer = setInterval(() => { elapsedEl.textContent = fmtElapsed(); }, 1000);
 
   api("/api/generate", { method: "POST", body: { novel_id: S.novelId, step, params } })
     .then(({ task_id }) => {
+      cancelBtn.onclick = async () => {
+        if (!confirm("确定取消当前生成？服务端请求会被立即中断，已生成的进度会保留。")) return;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = "正在取消…";
+        try { await api(`/api/tasks/${task_id}/cancel`, { method: "POST", body: {} }); }
+        catch (e) { /* 任务可能已结束，忽略 */ }
+      };
       const es = new EventSource(`/api/tasks/${task_id}/stream`);
       let streamed = "";
+      let reasoned = "";
       es.addEventListener("progress", (e) => {
         const d = JSON.parse(e.data);
         if (typeof d === "string") { statusEl.textContent = d; return; }
@@ -92,6 +126,15 @@ function runGeneration(step, params, { onToken, onDone, onError, streamTarget } 
           metaEl.textContent = "等待模型响应…";
           metaEl.classList.remove("hidden");
         }
+      });
+      es.addEventListener("reasoning", (e) => {
+        // 推理模型思考过程：暗色区域独立滚动，不混入正文
+        reasoned += JSON.parse(e.data);
+        metaEl.textContent = `🧠 思考中 · 已思考 ${reasoned.length} 字`;
+        metaEl.classList.remove("hidden");
+        reasoningEl.classList.remove("hidden");
+        reasoningEl.textContent = reasoned;
+        reasoningEl.scrollTop = reasoningEl.scrollHeight;
       });
       es.addEventListener("token", (e) => {
         const tok = JSON.parse(e.data);
@@ -109,6 +152,11 @@ function runGeneration(step, params, { onToken, onDone, onError, streamTarget } 
         alertMsg("success", `✅ 第${d.num}章「${d.title}」生成完成`);
         refreshNovel(true);
       });
+      // 服务端请求用户决策（如场景生成失败：重试/稍后继续/取消）
+      es.addEventListener("need_confirm", (e) => {
+        const d = JSON.parse(e.data);
+        showTaskConfirm(task_id, d.msg || "", d.options || []);
+      });
       es.addEventListener("done", (e) => {
         es.close(); finish();
         S.generating = false; renderTabs();
@@ -118,10 +166,12 @@ function runGeneration(step, params, { onToken, onDone, onError, streamTarget } 
         if (onDone) onDone(result);
       });
       es.addEventListener("error", (e) => {
-        es.close(); finish();
-        S.generating = false; renderTabs();
+        es.close();
         const msg = JSON.parse(e.data);
+        finish(msg);
+        S.generating = false; renderTabs();
         alertMsg("error", msg, 12000);
+        refreshNovel(true);  // 暂停/失败也可能产生断点数据，刷新以便立即查看已完成场景
         if (onError) onError(msg);
       });
       es.onerror = () => {
@@ -129,13 +179,74 @@ function runGeneration(step, params, { onToken, onDone, onError, streamTarget } 
       };
     })
     .catch((err) => {
-      finish();
+      finish(err.message);
       S.generating = false; renderTabs();
       alertMsg("error", err.message, 12000);
       if (onError) onError(err.message);
     });
 
-  function finish() { overlay.classList.add("hidden"); }
+  function finish(errMsg) {
+    clearInterval(elapsedTimer);
+    document.querySelectorAll(".task-confirm-overlay").forEach(n => n.remove());
+    overlay.classList.remove("confirming");
+    cancelBtn.classList.add("hidden");
+    if (errMsg) {
+      // 错误：遮罩常驻，显示错误信息与关闭按钮，停止 spinner
+      spinnerEl.classList.add("hidden");
+      statusEl.textContent = "生成失败";
+      errorEl.textContent = `❌ ${errMsg}`;
+      errorEl.classList.remove("hidden");
+      closeBtn.classList.remove("hidden");
+    } else {
+      overlay.classList.add("hidden");
+    }
+  }
+  closeBtn.onclick = () => { overlay.classList.add("hidden"); };
+}
+
+// 任务内用户决策对话框（阻塞在服务端，直到用户点击或前端连接断开）
+function showTaskConfirm(taskId, msg, options) {
+  // 同时只保留一个确认框；确认期间隐藏底层生成遮罩，避免双层底板叠加
+  document.querySelectorAll(".task-confirm-overlay").forEach(n => n.remove());
+  const genOverlay = $("#gen-overlay");
+  genOverlay.classList.add("confirming");
+  const ov = el("div", "task-confirm-overlay");
+  const card = el("div", "task-confirm-card");
+  const opts = options.length ? options : [{ action: "retry", label: "重试" }];
+  const msgEl = el("div", "task-confirm-msg", msg);
+  const row = el("div", "row");
+  row.style.marginTop = "14px";
+
+  const respond = async (action) => {
+    card.querySelectorAll("button").forEach(x => x.disabled = true);
+    try {
+      await api(`/api/tasks/${taskId}/respond`, { method: "POST", body: { action } });
+      ov.remove();
+      genOverlay.classList.remove("confirming");
+    } catch (err) {
+      alertMsg("error", `响应失败：${err.message}`);
+      card.querySelectorAll("button").forEach(x => x.disabled = false);
+    }
+  };
+
+  // 关闭 = 稍后决定：只保留断点并暂停任务，不会选择“从头生成”等破坏性操作
+  if (opts.some(o => o.action === "resume_later")) {
+    const close = el("button", "task-confirm-close", "×");
+    close.type = "button";
+    close.title = "稍后决定（保留进度）";
+    close.setAttribute("aria-label", "关闭并稍后决定");
+    close.onclick = () => respond("resume_later");
+    card.appendChild(close);
+  }
+
+  for (const o of opts) {
+    const b = el("button", o.action === "retry" || o.action === "resume" ? "btn primary small" : "btn small", o.label || o.action);
+    b.onclick = () => respond(o.action);
+    row.appendChild(b);
+  }
+  card.append(msgEl, row);
+  ov.appendChild(card);
+  document.body.appendChild(ov);
 }
 
 // ---------- 数据加载 ----------
@@ -213,14 +324,19 @@ async function refreshProviders() {
     providers.map(p => `<option value="${esc(p.name)}" ${p.name === active.name ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   sel.onchange = async () => {
     if (sel.value) {
-      await api("/api/providers/active", { method: "POST", body: { name: sel.value } });
+      const sw = await api("/api/providers/active", { method: "POST", body: { name: sel.value } });
       alertMsg("success", `已切换到配置「${sel.value}」，正在自动测试连接…`);
+      if (sw && sw.running_tasks > 0) {
+        alertMsg("warn", `注意：有 ${sw.running_tasks} 个任务正在使用旧配置（${(sw.running_models || []).join("、")}）运行，`
+          + `切换不影响它们；如需立即停止，请在生成遮罩中点「⏹ 取消生成」。刷新页面不会中断后台任务！`, 12000);
+      }
       refreshUsage();
       // 切换配置后自动测试连接
       const p = providers.find(x => x.name === sel.value);
       if (p) {
         const r = await testProviderConn(p);
         alertMsg(r.ok ? "success" : "error", `${r.msg}（${r.latency}ms）`);
+        if (r.ok) refreshProviders();  // 探测写回能力信息后刷新表单（解锁思考强度下拉）
       } else {
         renderConnStatus();
       }
@@ -244,10 +360,43 @@ async function refreshProviders() {
   const keyI = mkField("API Key", "服务商后台获取的接口密钥，只保存在本地 user_config.json", "sk-...");
   const baseI = mkField("API Base URL", "接口地址（OpenAI 兼容格式），如火山方舟 https://ark.cn-beijing.volces.com/api/v3/chat/completions", "https://.../chat/completions");
   const modelI = mkField("接口模型名", "服务商要求填写的模型 ID（这才是发给接口的模型名），如 doubao-pro-32k、deepseek-chat", "如 doubao-pro-32k");
+  const maxOutI = mkField("单次输出上限 max_output（可选）", "模型单次最大输出 token 数，请查服务商文档填写（如 65536 / 131072）。留空默认 65536。注意：推理模型的「思考」也占用此额度", "65536");
+  maxOutI.inputMode = "numeric";
+  // 关闭思考（仅部分服务商支持，如 DeepSeek/豆包；测试连接会探测支持情况）
+  const tdWrap = el("div");
+  tdWrap.style.marginTop = "8px";
+  tdWrap.innerHTML = `<label class="caption" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+    <input type="checkbox" id="thinking-disabled"> 关闭思考模式（仅推理模型）</label>
+    <div class="field-hint">勾选后请求会携带「关闭思考」参数（DeepSeek/豆包等支持；不支持的接口会在测试连接或生成时提示）。关闭后 temperature 调节才生效，生成更快更省 token；需要更强推理质量时请勿勾选。</div>`;
+  const tdI = tdWrap.querySelector("#thinking-disabled");
+  body.appendChild(tdWrap);
+  // 思考强度（探测出推理模型后可选）
+  const effortWrap = el("div");
+  effortWrap.style.marginTop = "8px";
+  effortWrap.innerHTML = `<label class="field" style="margin:0">思考强度（仅推理模型）</label>`;
+  const effortSel = el("select");
+  const effortHint = el("div", "field-hint", "需先「测试连接」探测模型能力；留「默认」则不向接口传该参数");
+  effortWrap.append(effortSel, effortHint);
+  body.appendChild(effortWrap);
   // 选中配置时回填
   const fill = () => {
     const p = providers.find(x => x.name === sel.value);
-    if (p) { nameI.value = p.name; keyI.value = p.api_key || ""; baseI.value = p.api_base || ""; modelI.value = p.model || ""; }
+    if (p) {
+      nameI.value = p.name; keyI.value = p.api_key || ""; baseI.value = p.api_base || ""; modelI.value = p.model || "";
+      maxOutI.value = p.max_output || "";
+      tdI.checked = !!p.thinking_disabled;
+      if (p.reasoning && p.thinking_disable === false) {
+        tdWrap.querySelector(".field-hint").textContent = "⚠️ 上次测试探测：该接口可能不支持关闭思考（勾选后仍会输出思考内容时会有告警提示）";
+      }
+      const opts = ["", ...(p.reasoning_effort_options || [])];
+      effortSel.innerHTML = opts.map(o => `<option value="${o}" ${o === (p.reasoning_effort || "") ? "selected" : ""}>${o || "默认（不传参）"}</option>`).join("");
+      effortSel.disabled = !p.reasoning;
+      effortWrap.querySelector("label").innerHTML =
+        `思考强度（仅推理模型）${p.reasoning ? ' <span title="测试连接已探测为推理模型">🧠</span>' : ""}`;
+    } else {
+      effortSel.innerHTML = `<option value="">默认（不传参）</option>`;
+      effortSel.disabled = true;
+    }
   };
   sel.addEventListener("change", fill); fill();
 
@@ -255,29 +404,76 @@ async function refreshProviders() {
   const saveBtn = el("button", "btn primary small", "💾 保存并启用");
   saveBtn.onclick = async () => {
     try {
-      const body = { name: nameI.value, api_key: keyI.value, api_base: baseI.value, model: modelI.value };
+      const body = { name: nameI.value, api_key: keyI.value, api_base: baseI.value, model: modelI.value,
+                     max_output: +maxOutI.value || null, reasoning_effort: effortSel.value || null,
+                     thinking_disabled: tdI.checked };
       await api("/api/providers", { method: "POST", body });
       alertMsg("success", "配置已保存并启用，正在自动测试连接…");
       refreshProviders(); refreshUsage();
       const r = await testProviderConn(body);
       alertMsg(r.ok ? "success" : "error", `${r.msg}（${r.latency}ms）`);
+      refreshProviders();  // 测试探测会写回推理能力信息，刷新表单（思考强度下拉）
     } catch (e) { alertMsg("error", e.message); }
   };
   const testBtn = el("button", "btn small", "🔌 测试连接");
   testBtn.onclick = async () => {
     testBtn.disabled = true; testBtn.textContent = "测试中…";
-    const r = await testProviderConn({ name: nameI.value, api_key: keyI.value, api_base: baseI.value, model: modelI.value });
+    const r = await testProviderConn({ name: nameI.value, api_key: keyI.value, api_base: baseI.value, model: modelI.value, max_output: +maxOutI.value || null });
     if (r.msg) alertMsg(r.ok ? "success" : "error", `${r.msg}（${r.latency}ms）`);
     testBtn.disabled = false; testBtn.textContent = "🔌 测试连接";
+    // 探测结果已写回同名配置（推理能力/思考强度档位），刷新表单以解锁下拉框
+    if (r.ok) refreshProviders();
   };
   const delBtn = el("button", "btn small", "🗑️ 删除");
   delBtn.onclick = async () => {
     if (!sel.value || !confirm(`删除配置「${sel.value}」？`)) return;
     await api(`/api/providers/${encodeURIComponent(sel.value)}`, { method: "DELETE" });
     refreshProviders(); renderConnStatus();
-  };
-  row.append(saveBtn, testBtn, delBtn);
+  };  row.append(saveBtn, testBtn, delBtn);
   body.appendChild(row);
+
+  // ---- 高级设置：每步 max_tokens 覆盖 ----
+  const adv = el("details");
+  adv.style.marginTop = "10px";
+  adv.innerHTML = `<summary class="caption">⚙️ 高级设置：每步 max_tokens 覆盖（留空 = 用默认值）</summary>`;
+  const advInner = el("div");
+  advInner.style.marginTop = "6px";
+  adv.appendChild(advInner);
+  body.appendChild(adv);
+  adv.addEventListener("toggle", async () => {
+    if (!adv.open || advInner.dataset.loaded) return;
+    try {
+      const s = await api("/api/settings/max-tokens");
+      const STEP_LABELS = { ...STEP_NAMES, ...(s.extra_steps || {}) };
+      const allSteps = { ...s.defaults };
+      for (const k of Object.keys(s.extra_steps || {})) allSteps[k] = null; // 内部计算步骤无固定默认
+      const tbl = el("div");
+      for (const [k, def] of Object.entries(allSteps)) {
+        const r = el("div", "row");
+        r.style.cssText = "align-items:center;gap:6px;margin-top:4px";
+        const lb = el("label", "caption shrink", STEP_LABELS[k] || k);
+        lb.style.minWidth = "110px";
+        const inp = el("input");
+        inp.type = "number"; inp.min = "100"; inp.step = "100";
+        inp.style.width = "110px";
+        inp.placeholder = def ? `默认 ${def}` : "自动计算";
+        inp.value = (s.overrides || {})[k] || "";
+        inp.dataset.step = k;
+        r.append(lb, inp);
+        tbl.appendChild(r);
+      }
+      const saveOv = el("button", "btn small", "💾 保存覆盖设置");
+      saveOv.style.marginTop = "8px";
+      saveOv.onclick = async () => {
+        const overrides = {};
+        tbl.querySelectorAll("input").forEach(i => { if (+i.value > 0) overrides[i.dataset.step] = +i.value; });
+        await api("/api/settings/max-tokens", { method: "POST", body: { overrides } });
+        alertMsg("success", "max_tokens 覆盖已保存（全局生效）");
+      };
+      advInner.append(tbl, saveOv);
+      advInner.dataset.loaded = "1";
+    } catch (e) { advInner.textContent = e.message; }
+  });
 }
 
 async function renderConnStatus() {
@@ -311,7 +507,7 @@ async function testProviderConn(p) {
   localStorage.setItem("conn_status", JSON.stringify({ testing: true, name: p.name, model: p.model }));
   renderConnStatus();
   try {
-    const r = await api("/api/providers/test", { method: "POST", body: { name: p.name, api_key: p.api_key || "", api_base: p.api_base || "", model: p.model || "" } });
+    const r = await api("/api/providers/test", { method: "POST", body: { name: p.name, api_key: p.api_key || "", api_base: p.api_base || "", model: p.model || "", max_output: +p.max_output || null } });
     localStorage.setItem("conn_status", JSON.stringify(r));
     renderConnStatus();
     return r;
@@ -872,9 +1068,11 @@ function renderChapterManager(root) {
   modeBtn.onclick = () => { chUI.deleteMode = !chUI.deleteMode; chUI.toDelete.clear(); renderTabContent(); };
   opsRow.append(modeBtn);
   if (chUI.deleteMode && chUI.toDelete.size) {
-    const doDel = el("button", "btn primary small shrink", `确认删除选中的 ${chUI.toDelete.size} 章`);
+    // 批量删除：明确列出具体章节号，而不只是数量
+    const nums = [...chUI.toDelete].sort((a, b) => +a - +b);
+    const doDel = el("button", "btn primary small shrink", `确认删除（第${nums.join("、")}章）`);
     doDel.onclick = async () => {
-      if (!confirm(`确定删除 ${chUI.toDelete.size} 个章节？不可恢复！`)) return;
+      if (!confirm(`确定删除以下章节？不可恢复！\n第${nums.join("、")}章（共 ${nums.length} 章）`)) return;
       for (const k of chUI.toDelete) await delSection("chapter", `chapter_${k}`);
       chUI.deleteMode = false; chUI.toDelete.clear();
       refreshNovel(true);
@@ -908,8 +1106,8 @@ function renderChapterManager(root) {
         chUI.toDelete.has(k) ? chUI.toDelete.delete(k) : chUI.toDelete.add(k);
         renderTabContent();
       } else {
-        chUI.activeKey = k; renderTabContent();
-        setTimeout(() => $("#chapter-editor")?.scrollIntoView({ behavior: "smooth" }), 50);
+        chUI.activeKey = chUI.activeKey === k ? "" : k; renderTabContent();
+        if (chUI.activeKey === k) setTimeout(() => $("#chapter-editor")?.scrollIntoView({ behavior: "smooth" }), 50);
       }
     };
     grid.append(card);
@@ -1160,9 +1358,14 @@ function renderChapterGenerator(root, bare = false) {
     const num = +box.querySelector("#ch-num").value;
     if (!extra(`chapter_beats_${num}`, "")) beatsDrafts[num] = beatsTa.value;  // 只暂存未保存的章
   });
-  box.querySelector("#ch-num").addEventListener("change", loadBeats);
-  sel.addEventListener("change", loadBeats);
-  loadBeats();
+  box.querySelector("#ch-num").addEventListener("change", () => loadBeatsGuarded());
+  sel.addEventListener("change", () => loadBeatsGuarded());
+  // 节拍异步加载期间禁用生成按钮，避免用户以空 beats 提交导致断点匹配失败（引用在按钮创建后注入）
+  let genBtnRef = null;
+  const loadBeatsGuarded = () => {
+    if (genBtnRef) genBtnRef.disabled = true;
+    Promise.resolve(loadBeats()).finally(() => { if (genBtnRef) genBtnRef.disabled = false; });
+  };
 
   // 黄金开篇
   const goldenRow = el("div", "row");
@@ -1185,6 +1388,47 @@ function renderChapterGenerator(root, bare = false) {
   };
   genRow.append(genBtn);
   box.append(genRow);
+  genBtnRef = genBtn;
+  loadBeatsGuarded();  // 首次加载节拍（替代原先的裸 loadBeats() 调用）
+  // 断点提示：本章有未完成的按场景生成进度时显示
+  const partialHint = el("div", "msg warn hidden");
+  partialHint.style.marginTop = "6px";
+  const partialDetail = el("details", "partial-detail hidden");
+  box.append(partialHint, partialDetail);
+  const refreshPartialHint = async () => {
+    const num = +box.querySelector("#ch-num").value;
+    partialHint.classList.add("hidden");
+    partialDetail.classList.add("hidden");
+    partialDetail.innerHTML = "";
+    try {
+      const { partials } = await api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter-partials`);
+      const p = (partials || []).find(x => x.chapter_num === num);
+      if (p) {
+        partialHint.textContent = `⏸️ 本章有未完成进度（已生成 ${p.done_scenes}${p.total_scenes ? `/${p.total_scenes}` : ""} 个场景），点击「生成本章」时将询问是否从断点续写`;
+        partialHint.classList.remove("hidden");
+
+        // 断点正文已随小说 extra 数据加载，直接展示已完成场景，避免“进度存在但看不见”
+        const saved = extra(`chapter_partial_${num}`, null);
+        const parts = saved?.parts || [];
+        if (parts.length) {
+          const summary = el("summary", "", `📄 查看已完成进度（${parts.length} 个场景，共 ${parts.join("").length} 字）`);
+          const list = el("div", "partial-scene-list");
+          parts.forEach((part, i) => {
+            const scene = el("details", "partial-scene");
+            const sceneSummary = el("summary", "", `场景 ${i + 1} · ${part.length} 字`);
+            const content = el("div", "content-view preview-scroll", part);
+            scene.append(sceneSummary, content);
+            list.appendChild(scene);
+          });
+          partialDetail.append(summary, list);
+          partialDetail.classList.remove("hidden");
+        }
+      }
+    } catch (e) { /* ignore */ }
+  };
+  box.querySelector("#ch-num").addEventListener("change", refreshPartialHint);
+  sel.addEventListener("change", refreshPartialHint);
+  refreshPartialHint();
 
   // 批量生成
   const batch = el("details");

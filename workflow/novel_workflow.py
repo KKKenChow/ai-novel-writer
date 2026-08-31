@@ -5,7 +5,7 @@ import logging
 import re
 import json
 from typing import Dict, List, Optional
-from api.api_client import LLMAPIClient
+from api.api_client import LLMAPIClient, GenerationCancelled
 from storage.json_store import JsonNovelStore
 from workflow.text_quality import detect_cliches, cliche_report, cliche_avoidance_instruction
 from workflow import character_cards as cc
@@ -36,6 +36,11 @@ def is_ai_refusal(text: str) -> bool:
     text_lower = text.lower()
     return any(kw in text_lower for kw in _REFUSAL_KEYWORDS)
 
+class ChapterPaused(Exception):
+    """章节生成被用户暂停/取消。message 为面向用户的友好说明。"""
+    pass
+
+
 class FullNovelWorkflow:
     def __init__(self, api_client: LLMAPIClient, vector_store: JsonNovelStore):
         self.api = api_client
@@ -46,6 +51,11 @@ class FullNovelWorkflow:
         # 可选回调（供 Web 界面使用）：阶段进度 fn(str)、正文流式输出 fn(str)
         self.on_progress = None
         self.on_token = None
+        # 可选回调：推理模型思考过程流式输出 fn(str)
+        self.on_reasoning = None
+        # 可选回调：需要用户决策时调用 fn(msg, options: list[dict]) -> action str（阻塞等待）
+        # options 形如 [{"action": "retry", "label": "重试"}, ...]；未设置时返回 None
+        self.on_confirm = None
 
     def _report(self, msg: str, **fields):
         """上报阶段进度（未设置回调时为空操作）。
@@ -61,6 +71,16 @@ class FullNovelWorkflow:
                     pass
             except Exception:
                 pass
+
+    def _confirm(self, msg: str, options: list) -> Optional[str]:
+        """请求用户决策（未设置回调时返回 None，调用方走默认行为）"""
+        cb = self.on_confirm
+        if not cb:
+            return None
+        try:
+            return cb(msg, options)
+        except Exception:
+            return None
     
     def generate_world_setting(self, user_prompt: str, max_tokens: int = 2000) -> str:
         """第一步：生成世界观设定"""
@@ -277,7 +297,7 @@ class FullNovelWorkflow:
                          getattr(self.api, "MAX_TOKENS_LIMIT", max_tokens))
         self._report("正在生成小说大纲…", stage=1, stage_total=1, phase="requesting")
         return self.api.generate(prompt, step="outline", temperature=0.7, max_tokens=max_tokens,
-                                 stream_callback=self.on_token)
+                                 stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
     
     @staticmethod
     def _plan_volumes(total_chapters: int) -> list:
@@ -345,7 +365,7 @@ class FullNovelWorkflow:
 
         self._report("大纲第一阶段：正在生成卷级规划…", stage=1, stage_total=2, phase="requesting")
         stage1_result = self.api.generate(stage1_prompt, step="outline", temperature=0.7, max_tokens=max_tokens,
-                                          stream_callback=self.on_token)
+                                          stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
         logger.info(f"大纲第一阶段完成，卷级大纲长度: {len(stage1_result)} 字符")
         logger.debug(f"卷级大纲原文：\n{stage1_result}")
 
@@ -436,7 +456,7 @@ class FullNovelWorkflow:
                 self._report(f"正在补全卷「{vol_name}」（第{start_ch}-{end_ch}章）的章节概要…",
                              stage=2, stage_total=2, phase="requesting")
                 vol_result = self.api.generate(stage2_prompt, step="outline", temperature=0.7, max_tokens=vol_max_tokens,
-                                               stream_callback=self.on_token)
+                                               stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
                 break
             except Exception as e:
                 logger.warning(f"卷「{vol_name}」第 {attempt + 1} 次生成失败: {e}")
@@ -1349,9 +1369,8 @@ class FullNovelWorkflow:
             max_tokens = needed_mt
         
         # 先删除存储中当前章节的旧数据，避免旧标题/内容污染搜索结果
-        self.vs.delete_section("chapter", f"chapter_{chapter_num}")
-        logger.info(f"已预删除存储中 chapter_{chapter_num} 的旧数据")
-        
+        # 注意：删除发生在用户确认生成方式之后（见下方 _delete_stale_chapter 调用点），
+        # 否则用户在断点弹窗选择"稍后决定"时旧正文会被误删
         ctx = self._build_chapter_context(chapter_num, chapter_title, previous_summary)
         context_text = ctx["context_text"]
         if extra_instruction.strip():
@@ -1373,11 +1392,14 @@ class FullNovelWorkflow:
         
         # ---- 有细纲时：按场景卡逐段生成 ----
         if beats and beats.strip():
+            # 断点决策（续写/暂停/重来）在 _generate_chapter_by_beats 内部完成，
+            # 旧章节内容的删除发生在决策之后，避免用户选择"稍后决定"时误删旧正文
             result = self._generate_chapter_by_beats(
                 chapter_num, chapter_title, beats, context_text, pacing_instruction,
                 anti_rush, target_words, max_tokens, temperature
             )
         else:
+            # 旧章节内容的删除在 _generate_chapter_single 内部（生成前）执行
             result = self._generate_chapter_single(
                 chapter_num, chapter_title, context_text, pacing_instruction,
                 anti_rush, phase, target_words, max_tokens, temperature
@@ -1423,7 +1445,7 @@ class FullNovelWorkflow:
             # 续写时的 token 预算：按剩余字数的2倍估算（中文字符≈1.5-2 token）
             continue_max = min(max_tokens, max(2000, int(remaining * 2)))
             self._report(f"第{chapter_num}章已写{len(result)}字，进行第{continuation_round}轮续写…")
-            continuation = self.api.generate(continue_prompt, step="chapter", temperature=temperature, max_tokens=continue_max, stream_callback=self.on_token)
+            continuation = self.api.generate(continue_prompt, step="chapter", temperature=temperature, max_tokens=continue_max, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
             # 续写拼接时补分隔符，避免段落粘连
             if result and not result.endswith("\n"):
                 result += "\n\n"
@@ -1471,6 +1493,12 @@ class FullNovelWorkflow:
         
         return result
     
+    def _delete_stale_chapter(self, chapter_num: int):
+        """删除存储中当前章节的旧数据，避免旧标题/内容污染检索结果。
+        必须在用户确认生成方式之后调用（断点弹窗选择"稍后决定"时不得删除旧正文）。"""
+        self.vs.delete_section("chapter", f"chapter_{chapter_num}")
+        logger.info(f"已预删除存储中 chapter_{chapter_num} 的旧数据")
+
     def _chapter_hard_requirements(self, phase: str, target_words: int, anti_rush: str) -> str:
         """按阶段生成章节硬性要求文本"""
         if phase == "opening":
@@ -1515,10 +1543,13 @@ class FullNovelWorkflow:
         # 套话规避指令（proactive 防御）
         prompt = prompt.replace("正文：", self._cliche_instruction() + "\n\n正文：")
         
+        # 兜底删除旧章节数据（beats 解析失败回退到本路径时，主流程的删除点不会被经过）
+        self._delete_stale_chapter(chapter_num)
+        
         logger.info(f"完整prompt长度: {len(prompt)}字 (约{len(prompt)*2}token)")
         logger.info(f"API调用参数: model={self.api.model}, max_tokens={max_tokens}, temperature={temperature}")
         
-        return self.api.generate(prompt, step="chapter", temperature=temperature, max_tokens=max_tokens, stream_callback=self.on_token)
+        return self.api.generate(prompt, step="chapter", temperature=temperature, max_tokens=max_tokens, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
     
     @staticmethod
     def parse_beats(beats_text: str) -> list:
@@ -1531,7 +1562,9 @@ class FullNovelWorkflow:
     
     def _generate_chapter_by_beats(self, chapter_num, chapter_title, beats_text, context_text,
                                    pacing_instruction, anti_rush, target_words, max_tokens, temperature) -> str:
-        """按场景卡逐段生成：每个场景一次 API 调用，带前文末尾保持连贯，最后拼接"""
+        """按场景卡逐段生成：每个场景一次 API 调用，带前文末尾保持连贯，最后拼接。
+        断点保护：每完成一个场景立即落盘（extra/chapter_partial_N）；场景失败时
+        通过 on_confirm 询问用户：重试 / 稍后继续（保留断点） / 取消（已生成场景存为草稿）。"""
         beats = self.parse_beats(beats_text)
         if not beats:
             logger.warning("细纲解析失败，回退到一次性生成")
@@ -1540,17 +1573,78 @@ class FullNovelWorkflow:
                 anti_rush, self._classify_chapter_phase(chapter_num, self._estimate_total_chapters())["phase"],
                 target_words, max_tokens, temperature
             )
-        
+
         words_per_beat = max(400, target_words // len(beats))
-        beat_max_tokens = min(max(1500, int(words_per_beat * 2)), self.api.MAX_TOKENS_LIMIT)
-        logger.info(f"按细纲生成：{len(beats)} 个场景，每场景约 {words_per_beat} 字")
-        
+        # 每场景 max_tokens：用户可在「高级设置」用 chapter_scene 覆盖（推理模型思考也占额度，默认可能不够）
+        beat_max_tokens = self._step_max_tokens("chapter_scene") or \
+            min(max(1500, int(words_per_beat * 2)), self.api.MAX_TOKENS_LIMIT)
+        logger.info(f"按细纲生成：{len(beats)} 个场景，每场景约 {words_per_beat} 字，beat_max_tokens={beat_max_tokens}")
+
+        # ---- 断点检测：同章同细纲的未完成进度可续写 ----
+        partial_key = f"chapter_partial_{chapter_num}"
         parts = []
+        partial = self.vs.load_extra_data(partial_key)
+        # 比对前归一化空白，避免 trim/换行差异导致断点被误判为不匹配
+        saved_beats = (partial.get("beats_text") or "").strip() if partial else ""
+        if partial and saved_beats == beats_text.strip() and partial.get("parts"):
+            saved = partial["parts"]
+            choice = self._confirm(
+                f"检测到第{chapter_num}章有未完成进度（已生成 {len(saved)}/{len(beats)} 个场景），是否从断点续写？",
+                [{"action": "resume", "label": "从断点续写"},
+                 {"action": "resume_later", "label": "稍后决定（保留进度）"},
+                 {"action": "restart", "label": "放弃进度，从头生成"}])
+            if choice == "resume":
+                parts = list(saved)
+                logger.info(f"第{chapter_num}章从断点续写：已完成 {len(parts)}/{len(beats)} 场景")
+                self._report(f"第{chapter_num}章：从断点续写（已完成 {len(parts)}/{len(beats)} 场景）")
+            elif choice in (None, "resume_later"):
+                # 前端断开或用户点关闭：安全暂停，绝不能把未响应误判为“从头生成”
+                logger.info(f"第{chapter_num}章断点决策暂停：已完成 {len(saved)}/{len(beats)} 场景")
+                self._report(f"第{chapter_num}章：已暂停，断点进度已保留")
+                raise ChapterPaused(
+                    f"已暂停：第{chapter_num}章断点进度已保留（{len(saved)}/{len(beats)} 场景），稍后生成该章时可继续选择")
+            else:
+                self.vs.save_extra_data(partial_key, None)
+                logger.info(f"第{chapter_num}章放弃断点进度，从头生成")
+        elif partial and partial.get("parts") and self.on_confirm is not None:
+            # 细纲已变更但旧断点仍有进度：不再静默丢弃，交由用户决定（Web 交互路径）
+            saved = partial["parts"]
+            choice = self._confirm(
+                f"检测到第{chapter_num}章有旧断点进度（已完成 {len(saved)} 个场景），但与当前场景节拍不一致。\n"
+                f"继续使用旧断点会按当前节拍重新生成（旧进度作废）。",
+                [{"action": "restart", "label": "放弃旧断点，从头生成"},
+                 {"action": "resume_later", "label": "稍后决定（保留进度）"}])
+            if choice in (None, "resume_later"):
+                logger.info(f"第{chapter_num}章旧断点保留（节拍不一致，用户暂停）")
+                raise ChapterPaused(
+                    f"已暂停：第{chapter_num}章旧断点进度已保留（{len(saved)} 个场景），"
+                    f"恢复原来的场景节拍后可从断点续写")
+            self.vs.save_extra_data(partial_key, None)
+            logger.info(f"第{chapter_num}章节拍已变更，用户确认放弃旧断点")
+        elif partial:
+            # 非交互路径（CLI/测试/批量）：细纲已变更，旧断点作废
+            self.vs.save_extra_data(partial_key, None)
+
+        # 断点决策已完成（继续/重来），此处才删除旧章节内容
+        self._delete_stale_chapter(chapter_num)
+
+        def _save_partial():
+            self.vs.save_extra_data(partial_key, {
+                "chapter_num": chapter_num, "title": chapter_title,
+                "beats_text": beats_text, "parts": parts,
+            })
+
         for i, beat in enumerate(beats):
+            if i < len(parts):
+                continue  # 断点续写：跳过已完成场景
+            # 用户取消检查点：场景间及时止损（断点已逐场景落盘，取消不丢进度）
+            if getattr(self.api, "cancel_check", None) and self.api.cancel_check():
+                _save_partial()
+                raise GenerationCancelled(f"已取消：第{chapter_num}章进度已保存（{len(parts)}/{len(beats)} 场景）")
             prev_tail = ""
             if parts:
                 prev_tail = f"\n\n【前文末尾】\n{(''.join(parts))[-1200:]}\n\n请紧接前文继续，不要重复已写内容。"
-            
+
             prompt = f"""你正在写小说第 {chapter_num} 章 "{chapter_title}"。本章已按场景卡规划好，你只负责写**第 {i+1}/{len(beats)} 个场景**的正文。
 
 {context_text}
@@ -1572,12 +1666,53 @@ class FullNovelWorkflow:
 - 直接输出正文，不要输出场景标题，不要解释
 
 正文："""
-            self._report(f"第{chapter_num}章：正在生成场景 {i+1}/{len(beats)}…")
-            part = self.api.generate(prompt, step="chapter", temperature=temperature, max_tokens=beat_max_tokens, stream_callback=self.on_token)
-            parts.append(part.strip())
-            logger.info(f"场景 {i+1}/{len(beats)} 完成，{len(part)} 字")
-        
+            # 单场景生成 + 失败时的用户决策循环
+            while True:
+                self._report(f"第{chapter_num}章：正在生成场景 {i+1}/{len(beats)}…")
+                try:
+                    part = self.api.generate(prompt, step="chapter", temperature=temperature,
+                                             max_tokens=beat_max_tokens, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
+                    parts.append(part.strip())
+                    _save_partial()  # 每场景落盘，崩溃/取消不丢进度
+                    logger.info(f"场景 {i+1}/{len(beats)} 完成，{len(part)} 字")
+                    break
+                except Exception as e:
+                    logger.error(f"第{chapter_num}章场景 {i+1}/{len(beats)} 生成失败: {e}")
+                    _save_partial()
+                    if self.on_confirm is None:
+                        raise  # 无交互回调（CLI/测试）：保持原有行为，直接抛错（断点已保存）
+                    action = self._confirm(
+                        f"第{chapter_num}章场景 {i+1}/{len(beats)} 生成失败：\n{str(e)[:300]}\n\n"
+                        f"已完成的 {len(parts)} 个场景进度已保存。",
+                        [{"action": "retry", "label": "重试本场景"},
+                         {"action": "resume_later", "label": "稍后继续（保留进度）"},
+                         {"action": "cancel", "label": "取消（已生成场景存为草稿）"}])
+                    if action == "retry":
+                        continue
+                    if action == "cancel" and parts:
+                        # 已完成场景存为该章草稿正文，避免浪费已烧的 token
+                        draft = "\n\n".join(parts)
+                        self.vs.add_section("chapter", f"chapter_{chapter_num}",
+                                            f"第{chapter_num}章 {chapter_title}\n{draft}")
+                        self.vs.save_extra_data(partial_key, None)
+                        raise ChapterPaused(
+                            f"已取消：前 {len(parts)} 个场景已保存为第{chapter_num}章草稿，可手动编辑或重新生成")
+                    raise ChapterPaused(
+                        f"已暂停：第{chapter_num}章进度已保存（{len(parts)}/{len(beats)} 场景），"
+                        f"下次生成该章时可从断点续写。失败原因：{str(e)[:150]}")
+
+        # 整章完成，清除断点
+        self.vs.save_extra_data(partial_key, None)
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _step_max_tokens(step: str) -> Optional[int]:
+        """读取用户对某步骤的 max_tokens 覆盖值（未设置返回 None）。失败静默。"""
+        try:
+            from api import user_config
+            return user_config.get_max_tokens_overrides().get(step)
+        except Exception:
+            return None
     
     # ---------- Phase 2: 文风与合规 ----------
 
@@ -1989,7 +2124,7 @@ class FullNovelWorkflow:
 
 改写后正文："""
         
-        return self.api.generate(prompt, step="chapter", temperature=0.7, max_tokens=max_tokens, stream_callback=self.on_token)
+        return self.api.generate(prompt, step="chapter", temperature=0.7, max_tokens=max_tokens, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
     
     def generate_golden_chapter(self, chapter_num: int, chapter_title: str, max_tokens: int = 2500,
                                 target_words: int = 2000, beats: str = "") -> dict:
@@ -2504,7 +2639,7 @@ class FullNovelWorkflow:
 
 续写内容："""
         
-        result = self.api.generate(full_prompt, step="continue", temperature=0.8, max_tokens=max_tokens, stream_callback=self.on_token)
+        result = self.api.generate(full_prompt, step="continue", temperature=0.8, max_tokens=max_tokens, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
         return result
     
     def check_consistency(self, max_tokens: int = 4000, include_chapters: bool = True) -> str:

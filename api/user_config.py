@@ -13,7 +13,8 @@ _lock = threading.Lock()
 
 DEFAULT_CONFIG = {
     "active_provider": "",      # 当前启用的模型配置名称
-    "providers": [],            # [{"name","api_key","api_base","model"}]
+    "providers": [],            # [{"name","api_key","api_base","model","max_output","reasoning","reasoning_effort_options","reasoning_effort"}]
+    "max_tokens_overrides": {}, # 每步 max_tokens 用户覆盖 {step: int}，空值表示用默认
     "cumulative_usage": {       # 跨会话累计用量
         "calls": 0,
         "prompt_tokens": 0,
@@ -191,3 +192,45 @@ def set_skill_inject_chars(value: int):
     cfg = load_config()
     cfg["skill_inject_chars"] = max(100, int(value))
     save_config(cfg)
+
+
+# ---------- 每步 max_tokens 覆盖 ----------
+
+def get_max_tokens_overrides() -> Dict:
+    """返回 {step: int}，只含有效正整数项"""
+    raw = load_config().get("max_tokens_overrides", {}) or {}
+    out = {}
+    for k, v in raw.items():
+        try:
+            v = int(v)
+            if v > 0:
+                out[k] = v
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def set_max_tokens_overrides(overrides: Dict):
+    """整体写回覆盖表；无效值（非正整数）自动剔除"""
+    cfg = load_config()
+    cleaned = {}
+    for k, v in (overrides or {}).items():
+        try:
+            v = int(v)
+            if v > 0:
+                cleaned[str(k)] = v
+        except (ValueError, TypeError):
+            continue
+    cfg["max_tokens_overrides"] = cleaned
+    save_config(cfg)
+
+
+def update_provider_fields(name: str, fields: Dict):
+    """只更新 provider 的指定字段（如探测结果），不触碰其他字段"""
+    cfg = load_config()
+    for i, p in enumerate(cfg.get("providers", [])):
+        if p.get("name") == name:
+            p.update(fields)
+            cfg["providers"][i] = p
+            save_config(cfg)
+            return
