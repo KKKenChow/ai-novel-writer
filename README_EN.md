@@ -79,7 +79,7 @@
 ### Prerequisites
 
 - Python 3.9+
-- An LLM API Key (Volcengine Ark pay-per-use recommended)
+- An LLM API Key (any OpenAI-compatible provider, pay-per-use)
 
 ### 1. Clone the Project
 
@@ -126,10 +126,10 @@ You can switch to any OpenAI-compatible API provider:
 
 | Provider | API Base URL Example | Price Reference |
 |----------|---------------------|-----------------|
-| Volcengine Ark (Recommended) | `https://ark.cn-beijing.volces.com/api/v1/chat/completions` | 100K chars ≈ ¥3-5 |
+| Volcengine Ark | `https://ark.cn-beijing.volces.com/api/v1/chat/completions` | 100K chars ≈ ¥3-5 |
 | Baidu Qianfan | `https://qianfan.baidubce.com/v2` | Similar |
 | Alibaba Tongyi | `https://api.openai-proxy.org/v1` | Similar |
-| DeepSeek | `https://api.deepseek.com/v1` | Cheaper |
+| DeepSeek | `https://api.deepseek.com/v1` | 100K chars ≈ ¥1-3 (estimated) |
 | OpenAI | `https://api.openai.com/v1` | Slightly more expensive |
 
 Just change the API Base and model name — no code changes needed.
@@ -481,4 +481,3 @@ You are free to use, modify, and distribute this for personal or commercial proj
 
 - [FastAPI](https://fastapi.tiangolo.com/) - Lightweight web framework
 - [Graphviz](https://graphviz.org/) - Graph visualization tool
-- Volcengine - Cost-effective Chinese LLM

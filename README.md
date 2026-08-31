@@ -20,7 +20,7 @@
 - 📤 **一键导出**：完整小说导出Markdown格式，支持直接下载
 - 🔌 **通用兼容**：默认火山方舟豆包API（按量付费，完全合规），也可接任何OpenAI格式API
 - 🧩 **Skill 技能包**：可在界面装载/编写 Prompt 技能包（存于 `skills/` 目录），按创作步骤自动注入，自定义生成风格
-- 📥 **Skill 蒸馏与导入**：粘贴写作技巧文章一键蒸馏成结构化技能包（核心哲学+做法/禁止/示例+适用边界）；支持本地 zip/SKILL.md 导入外部 skill（如 sun-style-writing）；启停状态按小说独立保存，关键词重合度智能推荐
+- 📥 **Skill 蒸馏与导入**：粘贴写作技巧文章一键蒸馏成结构化技能包（核心哲学+做法/禁止/示例+适用边界）；支持本地 zip/SKILL.md 导入外部 skill；启停状态按小说独立保存，关键词重合度智能推荐
 - 📊 **用量面板**：侧边栏常驻显示本次会话与历史累计的 token 消耗、Skill 注入开销
 - 🔌 **连通状态**：多组自定义模型配置一键切换，一键测试连接，侧边栏状态灯实时显示连通状态
 - 🌐 **国内友好**：不用翻墙，访问稳定
@@ -136,7 +136,7 @@
 ### 前置要求
 
 - Python 3.9+
-- 一个大模型API Key（推荐火山方舟按量付费）
+- 一个大模型API Key（任选一家 OpenAI 兼容 API 服务商，按量付费）
 
 ### 1. 克隆项目
 
@@ -175,10 +175,10 @@ pip install -r requirements.txt
 
 | 服务商 | API Base URL 示例 | 价格参考 |
 |--------|-------------------|----------|
-| 火山方舟（推荐） | `https://ark.cn-beijing.volces.com/api/v1/chat/completions` | 10万字≈3-5元 |
+| 火山方舟 | `https://ark.cn-beijing.volces.com/api/v1/chat/completions` | 10万字≈3-5元 |
 | 百度千帆 | `https://qianfan.baidubce.com/v2` | 类似价格 |
 | 阿里通义 | `https://api.openai-proxy.org/v1` | 类似价格 |
-| DeepSeek | `https://api.deepseek.com/v1` | 更便宜 |
+| DeepSeek | `https://api.deepseek.com/v1` | 10万字≈1-3元（估算） |
 | OpenAI | `https://api.openai.com/v1` | 稍贵 |
 
 改完API Base和模型名称就能用，代码不用动。
@@ -327,7 +327,7 @@ Skill 是注入到各创作步骤 Prompt 前的「写作技法包」，让 AI �
 
 1. **按小说启停**：每个 Skill 的启用状态独立保存在当前小说里，切换小说互不影响
 2. **📥 从文章蒸馏**：粘贴写作技巧文章（可多篇），AI 自动蒸馏成结构化技能包——核心哲学 + 每条技法的「做法 / 禁止 / 正反对照示例」+ 适用边界，生成后可编辑再保存
-3. **🔗 导入外部 Skill**：以 [sun-style-writing](https://github.com/KKKKhazix/sun-style-writing) 为例——在仓库页点 `Code → Download ZIP` 下载，然后在「导入外部 Skill」处上传 zip 即可（自动识别嵌套目录里的 SKILL.md，并补上作用步骤）；也支持直接上传单个 SKILL.md 文件
+3. **🔗 导入外部 Skill**：将包含 SKILL.md 的 skill 仓库打包为 zip 上传即可（自动识别嵌套目录里的 SKILL.md，并补上作用步骤）；也支持直接上传单个 SKILL.md 文件
 4. **💡 智能推荐**：输入章节标题/大纲片段，基于关键词重合度推荐最匹配的未启用 Skill，一键启用
 5. **开销透明**：侧边栏「用量详情」实时显示每个步骤生效的 Skill 及注入字数（单个 Skill 超过 2000 字自动截断，防止 token 膨胀）
 
@@ -590,4 +590,3 @@ MIT License - 见 [LICENSE](LICENSE) 文件。
 ## 🙏 致谢
 
 - [FastAPI](https://fastapi.tiangolo.com/) - 轻量 Web 框架
-- 火山引擎 - 高性价比中文大模型
