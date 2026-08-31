@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI小说创作</title>
+<link rel="stylesheet" href="/style.css?v=5">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-section" id="current-novel-card"></div>
+    <details class="sidebar-section" id="novel-manager" open>
+      <summary>📚 小说管理</summary>
+      <div id="novel-manager-body"></div>
+    </details>
+  </aside>
+
+  <main id="main">
+    <div id="topbar">
+      <button id="sidebar-toggle" title="切换侧边栏">☰</button>
+      <h1>📖 AI小说创作</h1>
+      <div id="progress-bar-wrap"></div>
+      <button id="theme-toggle" title="切换白/黑主题">🌙</button>
+    </div>
+    <div id="alert-area"></div>
+    <nav id="tabs"></nav>
+    <div id="tab-content"></div>
+  </main>
+
+  <button id="rightbar-toggle" title="展开/收起 模型配置与用量面板">⚙️</button>
+  <aside id="rightbar" class="collapsed">
+    <div class="sidebar-section" id="conn-status"></div>
+    <details class="sidebar-section" id="provider-config" open>
+      <summary>⚙️ 模型配置</summary>
+      <div id="provider-config-body"></div>
+    </details>
+    <details class="sidebar-section" id="usage-panel" open>
+      <summary>📊 API 用量</summary>
+      <div id="usage-body"></div>
+    </details>
+  </aside>
+</div>
+
+<div id="gen-overlay" class="hidden">
+  <div class="gen-card">
+    <div class="spinner"></div>
+    <div id="gen-stage" class="hidden"></div>
+    <div id="gen-status">正在生成中…</div>
+    <div id="gen-meta" class="hidden"></div>
+    <pre id="gen-stream" class="hidden"></pre>
+  </div>
+</div>
+
+<script src="/app.js?v=6"></script>
+</body>
+</html>

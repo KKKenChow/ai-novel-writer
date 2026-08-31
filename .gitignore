@@ -48,6 +48,7 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.log
+.pytest_cache/
 
 # Python 版本管理
 .python-version

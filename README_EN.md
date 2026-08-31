@@ -2,26 +2,26 @@
 
 [中文](README.md) | English
 
-> 🚀 Low-cost AI novel creation with full-process local vector memory, compatible with mainstream APIs
+> 🚀 Low-cost AI novel creation with full-process local JSON storage and context memory, compatible with mainstream APIs
 
 ## ✨ Features
 
 - 💰 **Ultra-low cost**: Using domestic LLM APIs, a 100K-character novel costs only **¥3-5**
-- 🧠 **RAG Context Memory**: ChromaDB vector store is **completely local**, automatically retrieves relevant settings, solving AI "character breakdown" issues
+- 🧠 **Context Memory**: all settings are stored in **local JSON files** (readable, editable, backupable); context is assembled deterministically with keyword retrieval as a supplement, solving AI "character breakdown" issues
 - 🔗 **Full-chain creation**: World-building → Character design → Outline planning → Chapter generation → Continuation/Polishing, complete workflow
-- ✏️ **Editable & adjustable**: Every step supports manual editing after generation, changes auto-update the vector store
-- 💾 **Full data persistence**: All generated content, original text, prompts, consistency check results, and character graphs are auto-persisted to the vector store — no data loss when switching tabs or novels
+- ✏️ **Editable & adjustable**: Every step supports manual editing after generation, changes auto-save to local JSON
+- 💾 **Full data persistence**: All generated content, original text, prompts, consistency check results, and character graphs are auto-persisted to local JSON files (atomic writes) — no data loss when switching tabs or novels
 - 🎯 **Chapter word count target**: Set target word count per chapter (500-8000 characters), AI generates accordingly
 - 🔄 **Chapter re-editing**: Select generated chapters to re-edit or regenerate
 - 🎨 **Style polishing**: Polish existing text by imitating the writing style of a specified work or author
 - 🔍 **AI Consistency Check**: Automatically detect name contradictions, setting conflicts, and logical inconsistencies
 - 🔎 **Global Find & Replace**: One-click find and replace across all settings and chapters (e.g., auto-sync name changes)
-- 🕸️ **Character Relationship Graph**: AI auto-extracts character relationships, visualized with Graphviz
+- 🕸️ **Character Relationship Graph**: AI auto-extracts character relationships, visualized in the browser (drag/zoom)
 - 📤 **One-click Export**: Export complete novel in Markdown format with direct download
 - 🔌 **Universal Compatibility**: Defaults to Volcengine Ark Doubao API (pay-per-use, fully compliant), also supports any OpenAI-format API
 - 🌐 **China-friendly**: No VPN needed, stable access
-- 🔒 **Privacy & Security**: Vector store and all creative data stay on your local machine, never uploaded to third parties
-- 📚 **Multi-novel Management**: Manage multiple novels simultaneously with independent vector stores, one-click switching
+- 🔒 **Privacy & Security**: All creative data stays in local JSON files on your machine, never uploaded to third parties
+- 📚 **Multi-novel Management**: Manage multiple novels simultaneously with independent JSON files, one-click switching
 
 ---
 
@@ -29,7 +29,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                       Web UI (Streamlit)                         │
+│                   Web UI (FastAPI + single-page H5)              │
 │  World|Characters|Outline|Chapters|Continue|Polish|Consistency   │
 │           |Find&Replace|Character Graph|Export                   │
 └────────────────────────────┬─────────────────────────────────────┘
@@ -38,38 +38,38 @@
 │                    Full-chain Creative Workflow                  │
 │  Strict order: World → Characters → Outline → Chapters          │
 │  Upstream edit → Conflict warning → Global find/replace         │
-│  AI character relation extraction → Graphviz visualization      │
+│  AI character relation extraction → browser-side graph visualization      │
 │  Chapter generation: Categorized context building               │
 └────────────────────────────┬─────────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────────┐
 │ 🔍 RAG Retrieval Flow                                           │
-│  New chapter → Categorized context → Local vector store → AI    │
+│  New chapter → Categorized context → Local JSON store → AI      │
 │  Direct settings + Relevant outline + Previous summary + Search │
 └────────────────────────────┬─────────────────────────────────────┘
                              │
         ┌────────────────────┴────────────────────┐
         │                                    │
 ┌───────▼───────┐                ┌───────────▼───────────┐
-│ Local ChromaDB│                │   Cloud LLM API       │
-│ (Vector Store)│                │ (Doubao/GPT/Other)    │
+│ Local JSON    │                │   Cloud LLM API       │
+│ (novels_data/)│                │ (Doubao/GPT/Other)    │
 │  Free         │                │   Pay-per-token       │
 └───────────────┘                └───────────────────────┘
 ```
 
 ### Core Principles
 
-**Why use a local vector store?**
+**Why local JSON files instead of a vector database?**
 - AI context windows are limited; writing long novels causes AI to forget earlier settings, leading to character breakdown
 - RAG (Retrieval-Augmented Generation) only feeds the **most relevant** context for the current chapter, keeping token count stable — cost-effective and precise
-- Local vector store means no cloud vector service fees and better privacy
+- Key context (world/characters/outline/adjacent chapters) is assembled by deterministic rules — exact ID lookup and chapter-number ranges, no semantic matching required; plain JSON is readable, editable, git-backupable, with zero heavy dependencies
 
 **Chapter Generation Context Logic**
 - Instead of stuffing all content into the prompt, context is **categorized and controlled**:
-  1. **Direct settings extraction**: Get world-building (≤1500 chars) and characters (≤2000 chars) directly — more complete and precise than vector retrieval
+  1. **Direct settings extraction**: Get world-building (≤1500 chars) and characters (≤2000 chars) directly — complete and precise
   2. **Relevant outline extraction**: Only extract outline content for ±2 chapters around the current chapter
   3. **Previous chapter summary**: Only the last 800 chars of the most recent 2 chapters for continuity
-  4. **Semantic search supplement**: Use chapter title for semantic search in vector store, return up to 3 most relevant results; skip already-included settings/characters/outline to avoid duplication, other chapter content truncated to 500 chars each
+  4. **Keyword retrieval supplement**: Use chapter title for bigram keyword-overlap search in local storage, returning up to 4 relevant fragments; skip already-included settings/characters/outline to avoid duplication
   5. **Target word count control**: Specify target in prompt, but actual output is hard-limited by `max_tokens`
 
 ---
@@ -79,7 +79,6 @@
 ### Prerequisites
 
 - Python 3.9+
-- [Graphviz](https://graphviz.org/download/) system package (for character relationship graph rendering; macOS: `brew install graphviz`)
 - An LLM API Key (Volcengine Ark pay-per-use recommended)
 
 ### 1. Clone the Project
@@ -138,7 +137,7 @@ Just change the API Base and model name — no code changes needed.
 ### 4. Run
 
 ```bash
-streamlit run app.py
+python server.py
 ```
 
 The terminal will output a local address `http://localhost:8501` — open it in your browser.
@@ -168,9 +167,9 @@ When prerequisite steps are incomplete, the generate button is **disabled** with
 1. Describe the genre and setting you want in the text box
    - Example: `A modern urban cultivation novel where the protagonist stumbles upon cultivation heritage while working in a big city`
 2. Click "Generate World Setting"
-3. After generation, you can directly edit — changes auto-save to the vector store
+3. After generation, you can directly edit — changes auto-save to local JSON
 4. ⚠️ If downstream steps (characters/outline/chapters) already exist, editing the world setting will trigger a **conflict warning**
-5. Supports "🗑️ Clear World Setting" to one-click clear and delete vector store data
+5. Supports "🗑️ Clear World Setting" to one-click clear and delete local stored data
 
 #### Step 2 👤 Character Design
 1. **Prerequisite**: Must complete world-building first
@@ -196,9 +195,9 @@ When prerequisite steps are incomplete, the generate button is **disabled** with
    - Or manually enter a new chapter number and title
 3. **Set target word count**: 500-8000 characters, default 2000
 4. Click "Generate This Chapter"
-   - ✨ Auto-categorized context building (core settings + relevant outline + previous chapter summary + vector retrieval) ensures setting consistency
+   - ✨ Auto-categorized context building (core settings + relevant outline + previous chapter summary + keyword retrieval) ensures setting consistency
    - 💡 Click the **?** icon next to the chapter title to view AI context building details
-5. After generation, edit — changes auto-update vector store
+5. After generation, edit — changes auto-save to local storage
 6. Generated chapters can be re-generated with "🔄 Regenerate This Chapter"
 7. Supports "🗑️ Delete This Chapter" for individual chapter deletion
 
@@ -247,7 +246,7 @@ No need to manually update each step after changing a character name:
 3. Enter replacement text in "Replace With" (e.g., "Zhang San")
 4. Click "Execute Replace" → after confirmation, one-click replace across all content
 5. Replacement scope includes: world-building, character settings, outline, all chapters (title + content)
-6. Auto-syncs vector store after replacement
+6. Auto-syncs local storage after replacement
 
 #### Step 9 🕸️ Character Relationship Graph
 Visualize the relationship network between characters:
@@ -272,7 +271,7 @@ After completing all creation:
 
 ### Editing Existing Content
 
-All steps support manual editing after generation — edits auto-save to the vector store:
+All steps support manual editing after generation — edits auto-save to local JSON:
 
 - World-building, characters, outline, and chapter content can all be edited at any time
 - Changes auto-save on blur — no manual action needed
@@ -301,7 +300,7 @@ For example: if you change the protagonist's name from "Li Ming" to "Zhang San" 
 If you're unsatisfied with a step's result:
 - When content already exists, the generate button auto-changes to "🔄 Regenerate XXX"
 - Regeneration overwrites current content — confirm before proceeding
-- Each tab provides a "🗑️ Clear" button to one-click clear all data for that step (including persisted data in the vector store)
+- Each tab provides a "🗑️ Clear" button to one-click clear all data for that step (including locally persisted data)
 - Chapters support individual deletion
 
 ---
@@ -310,23 +309,23 @@ If you're unsatisfied with a step's result:
 
 ### Persistence Scope
 
-All operation results auto-save to the local ChromaDB vector store — no data loss when switching tabs or novels:
+All operation results auto-save to local JSON files (`novels_data/`, one file per novel) — no data loss when switching tabs or novels:
 
 | Data Type | Persisted Content | Storage Method |
 |----------|------------------|----------------|
-| World-Building | Generated content + original Prompt | Vector store section + extra_data |
-| Character Design | Generated content + original Prompt | Vector store section + extra_data |
-| Novel Outline | Generated content + original Prompt | Vector store section + extra_data |
-| Chapters | Chapter content + title | Vector store section |
+| World-Building | Generated content + original Prompt | JSON sections + extra_data |
+| Character Design | Generated content + original Prompt | JSON sections + extra_data |
+| Novel Outline | Generated content + original Prompt | JSON sections + extra_data |
+| Chapters | Chapter content + title | JSON sections |
 | Consistency Check | Check results | extra_data |
 | Character Graph | Graph JSON data | extra_data |
 
 ### extra_data Mechanism
 
-Non-core creative content (check results, original prompts, graph data, etc.) is stored in ChromaDB via the `extra_data` mechanism:
+Non-core creative content (check results, original prompts, graph data, etc.) is stored in the same JSON file via the `extra_data` mechanism:
 - Uses a single JSON document (`_extra_data`) to store all extra data
 - Read/write via `save_extra_data(key, value)` / `load_extra_data(key)` / `delete_extra_field(key)`
-- Managed independently from vector store sections
+- Managed independently from content sections
 
 ---
 
@@ -342,16 +341,16 @@ The left sidebar displays all novels — the currently selected one is shown as 
 
 | Operation | Description |
 |-----------|------------|
-| Create new novel | Enter name in the input box, auto-creates new vector store |
+| Create new novel | Enter name in the input box, auto-creates new data file |
 | Switch novel | Click "✏️ Open" button in the novel list |
 | Delete novel | Click "🗑️ Delete", confirm to delete |
 | Delete all novels | Click "💣️ Delete All", confirm to clear |
 
 ### Data Storage
 
-- Each novel is saved in an independent Collection under the `chroma_db/` directory
+- Each novel is saved as an independent JSON file under the `novels_data/` directory (atomic writes prevent corruption)
 - Novel ID format: `novel_timestamp` (no book name to avoid special character issues)
-- Auto-loads corresponding vector store data when switching novels (including all persisted extra_data)
+- Auto-loads corresponding JSON data when switching novels (including all persisted extra_data)
 - Exported novels are saved in the `output/` directory
 
 ---
@@ -394,19 +393,19 @@ The price of a cup of milk tea for a full-length novel.
 ai-novel-writer/
 ├── api/
 │   └── api_client.py           # Universal LLM API client (OpenAI-compatible)
-├── vector_store/
-│   └── local_chroma.py         # Local ChromaDB vector store wrapper (with extra_data persistence)
+├── storage/
+│   └── json_store.py           # Local JSON store (one file per novel, atomic writes, extra_data + keyword retrieval)
+├── tests/                      # pytest tests (parsing/filtering/phase classification/storage)
 ├── workflow/
 │   └── novel_workflow.py       # Full-chain creative workflow + consistency check + find/replace + character graph
-├── app.py                      # Streamlit Web UI (main entry, 10 feature tabs)
+├── server.py                   # FastAPI server (REST API + generation task queue + SSE push)
+├── web/                        # Single-page H5 frontend (vanilla JS, 11 feature tabs, no build step)
 ├── output/                     # Exported novels saved here (auto-created)
-├── chroma_db/                  # Chroma vector database files (auto-generated after running)
-├── .streamlit/
-│   └── config.toml             # Streamlit config (localhost only by default)
+├── novels_data/                # Novel data JSON files (auto-generated after running, gitignored)
 ├── requirements.txt            # Python dependencies
 ├── .env.example                # Environment variable template
 ├── .env                        # Environment variables (create yourself, do NOT commit to Git)
-├── .gitignore                  # Git ignore rules (excludes sensitive data and vector store)
+├── .gitignore                  # Git ignore rules (excludes sensitive and creative data)
 ├── LICENSE                     # MIT License
 └── README.md                   # Chinese README
 ```
@@ -415,11 +414,11 @@ ai-novel-writer/
 
 ## ❓ FAQ
 
-### Q: What is a vector store? What does "local" mean?
-A: A vector store is a **smart search engine** that helps AI remember previously written settings. "Local" means the data is stored on your own hard drive — free and private.
+### Q: Where is my data stored? Is it safe?
+A: Under `novels_data/` in the project directory — one **plain-text JSON file** per novel. You can open, edit, copy, or git-manage it directly. Free and private.
 
 ### Q: Can I use any AI model?
-A: Yes, as long as it's compatible with the OpenAI Chat API format. The vector store outputs plain text that any AI can understand.
+A: Yes, as long as it's compatible with the OpenAI Chat API format. The local store outputs plain text that any AI can understand.
 
 ### Q: Will prompts get longer and more expensive as I write?
 A: No. Chapter generation uses **categorized context building**: direct settings extraction (with truncation) + relevant outline extraction (only nearby chapters) + previous chapter summary (only last 2 chapters' endings) + semantic search supplement (up to 3 results, skipping already-included settings, other chapters truncated to 500 chars). Prompt length stays stable, and so does cost.
@@ -427,23 +426,23 @@ A: No. Chapter generation uses **categorized context building**: direct settings
 ### Q: What's the relationship between target word count and max_tokens?
 A: Chinese 1 character ≈ 1.5-2 tokens. If `max_tokens` < target word count × 1.5, AI output will be truncated before reaching the target (e.g., target 2000 chars but max_tokens set to 1500 — might only output ~1000 chars). Recommended: `max_tokens ≥ target word count × 1.5`.
 
-### Q: Will old data remain in the vector store after editing?
-A: No. Each save uses fixed document IDs (e.g., `setting_world_setting`, `chapter_chapter_1`). Editing auto-overwrites old data — the vector store always has the latest version.
+### Q: Will old data remain after editing?
+A: No. Each save uses fixed section IDs (e.g., `setting_world_setting`, `chapter_chapter_1`). Editing auto-overwrites old data — the JSON file always has the latest version.
 
 ### Q: How do I sync a character name change across all content?
-A: Use the "🔎 Global Find & Replace" feature! Enter the old name and new name, one-click replace across all settings and chapters, auto-syncs the vector store. No more manual updates one by one.
+A: Use the "🔎 Global Find & Replace" feature! Enter the old name and new name, one-click replace across all settings and chapters, auto-syncs local storage. No more manual updates one by one.
 
 ### Q: How is the character relationship graph generated?
-A: AI analyzes your character settings and outline to auto-extract characters and their relationships (mentor-student, lovers, enemies, etc.), then renders a visual graph with Graphviz. Each generation re-analyzes to ensure consistency with the latest settings. Graph data is persisted — no loss when switching tabs.
+A: AI analyzes your character settings and outline to auto-extract characters and their relationships (mentor-student, lovers, enemies, etc.), then renders a visual graph in the browser. Each generation re-analyzes to ensure consistency with the latest settings. Graph data is persisted — no loss when switching tabs.
 
 ### Q: Are consistency check and character graph results saved?
-A: Yes! All results (including consistency check results, character graph data, and original prompts for each step) are persisted via ChromaDB's extra_data mechanism. Data persists across tab switches and novel switches. Manual clear via the "🗑️ Clear" button.
+A: Yes! All results (including consistency check results, character graph data, and original prompts for each step) are persisted via the local JSON extra_data mechanism. Data persists across tab switches and novel switches. Manual clear via the "🗑️ Clear" button.
 
 ### Q: Is this project compliant? Will using Volcengine get my account suspended?
 A: If you follow the instructions and use **Volcengine Ark pay-per-use**, it's fully compliant — no account suspension. Just don't use CodingPlan discounted subscriptions for non-coding purposes.
 
 ### Q: Is it secure? Can others access my app over the network?
-A: The default config only listens on localhost (loopback) — not exposed externally. The `.env` file contains your API Key and is excluded in `.gitignore` — won't be committed to Git. The `chroma_db/` directory contains your creative data and is also excluded.
+A: The default config only listens on localhost (loopback) — not exposed externally. The `user_config.json` file contains your API Key and is excluded in `.gitignore` — won't be committed to Git. The `novels_data/` directory contains your creative data and is also excluded.
 
 ---
 
@@ -454,7 +453,6 @@ Issues and PRs are welcome:
 - [ ] Support auto-continuous multi-chapter generation
 - [ ] Support plot branching / story trees
 - [ ] Support PDF/EPUB export
-- [ ] Support more vector store backends (FAISS, Milvus, etc.)
 - [ ] Interactive character graph editing
 - [ ] Writing style templates (ancient Chinese, sci-fi, romance, etc.)
 - [ ] Custom context strategy for chapter generation
@@ -481,7 +479,6 @@ You are free to use, modify, and distribute this for personal or commercial proj
 
 ## 🙏 Acknowledgments
 
-- [ChromaDB](https://github.com/chroma-core/chroma) - Open-source lightweight vector database
-- [Streamlit](https://streamlit.io/) - Rapid web framework
+- [FastAPI](https://fastapi.tiangolo.com/) - Lightweight web framework
 - [Graphviz](https://graphviz.org/) - Graph visualization tool
 - Volcengine - Cost-effective Chinese LLM

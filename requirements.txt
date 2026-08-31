@@ -1,6 +1,7 @@
-# AI小说创作 - 通用API + 本地向量库 依赖
+# AI小说创作 - 通用API + 本地JSON存储 依赖
 requests>=2.31.0
-chromadb>=0.4.0
-streamlit>=1.30.0
-python-dotenv>=1.0.0
-graphviz>=0.20.1
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pyyaml>=6.0
+python-docx>=1.1.0  # 导出 docx（投稿排版）
+pytest>=8.0.0  # 开发/测试依赖
