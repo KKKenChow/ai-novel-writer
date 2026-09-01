@@ -155,3 +155,18 @@ def filter_cards_for_chapter(cards: List[Dict], chapter_num: int) -> Tuple[List[
             absent.append(c["name"])
         # 已退场的角色不注入详情也不进兜底名单（退场后一般不再需要）
     return active, absent
+
+
+def filter_cards_for_range(cards: List[Dict], start_ch: int, end_ch: int) -> List[Dict]:
+    """按卷/章节区间过滤角色卡（用于大纲、卷逐章细纲等整段规划场景）：
+    返回在该区间任意一章在场合的角色卡（登场章 ≤ 区间末 且 退场章 ≥ 区间首）。
+    无登场章按第 1 章，无退场章视为不退场。"""
+    if start_ch > end_ch:
+        start_ch, end_ch = end_ch, start_ch
+    active = []
+    for c in cards:
+        appear = c.get("appearance_chapter") or 1
+        exit_ch = c.get("exit_chapter")
+        if appear <= end_ch and (exit_ch is None or exit_ch >= start_ch):
+            active.append(c)
+    return active

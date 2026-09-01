@@ -190,7 +190,7 @@ def test_lazy_volume_generation_with_prev_context():
     wf.ensure_outline_for_chapter(61)
     vol2_prompt = wf.api.prompts[-1]
     assert "第 35-67 章" in vol2_prompt and "从第 35 章开始" in vol2_prompt
-    assert "前一卷逐章大纲" in vol2_prompt and "风34" in vol2_prompt  # 注入前卷内容解决盲写
+    assert "前一卷逐章概要" in vol2_prompt and "风34" in vol2_prompt  # 注入前卷内容解决盲写
 
     # 重复触发不重复生成
     n_prompts = len(wf.api.prompts)
@@ -261,3 +261,111 @@ def test_two_stage_single_volume_failure_not_fatal():
     assert "风1" in titles[1]
     assert "归1" in titles[68]
     assert 35 not in titles  # 失败卷缺失但不影响其他卷入库
+
+
+# ---------- 卷概要按卷切分 + 重新生成 ----------
+
+def test_current_volume_maps_chapter_to_volume():
+    wf = make_wf()
+    plan = [{"index": 1, "start": 1, "end": 40},
+            {"index": 2, "start": 41, "end": 80},
+            {"index": 3, "start": 81, "end": 100}]
+    assert wf._current_volume(plan, 1)["index"] == 1
+    assert wf._current_volume(plan, 40)["index"] == 1
+    assert wf._current_volume(plan, 41)["index"] == 2
+    assert wf._current_volume(plan, 99)["index"] == 3
+    assert wf._current_volume([], 5) is None
+    assert wf._current_volume(plan, 999) is None
+
+
+def test_slice_overview_by_volume_keeps_only_current_and_prev():
+    wf = make_wf()
+    ov = """故事主线：成长
+
+[卷]
+卷名：第一卷：起
+章节：第1-34章
+剧情：开局
+[/卷]
+
+[卷]
+卷名：第二卷：承
+章节：第35-67章
+剧情：发展
+[/卷]
+
+[卷]
+卷名：第三卷：转
+章节：第68-100章
+剧情：结局
+[/卷]
+"""
+    # 卷1第20章：只保留故事主线 + 卷1，卷2/卷3被丢弃
+    r = wf._slice_overview_by_volume(ov, 20)
+    assert "第一卷" in r and "剧情：开局" in r
+    assert "第二卷" not in r and "第三卷" not in r
+    # 卷2第50章：保留卷1(前一卷) + 卷2，丢弃卷3
+    r2 = wf._slice_overview_by_volume(ov, 50)
+    assert "第一卷" in r2 and "第二卷" in r2
+    assert "第三卷" not in r2
+    # 无卷块时原样返回
+    assert wf._slice_overview_by_volume("故事主线：x", 5) == "故事主线：x"
+
+
+def test_stage1_from_outline_marker_compat():
+    """逐章概要小节标记更名后，仍能识别旧数据里的「## 逐章大纲」标记"""
+    wf = make_wf()
+    new_outline = STAGE1 + "\n## 逐章概要\n第 1 章：风1 —— 概要"
+    assert wf._stage1_from_outline(new_outline) == STAGE1.rstrip()
+    # 旧标记兼容
+    old_outline = STAGE1 + "\n## 逐章大纲\n第 1 章：风1 —— 概要"
+    assert wf._stage1_from_outline(old_outline) == STAGE1.rstrip()
+    # 无标记：原样返回
+    assert wf._stage1_from_outline("故事主线：x") == "故事主线：x"
+
+
+def test_extract_relevant_outline_with_current_volume_no_later_leak():
+    wf = make_wf()
+    outline = STAGE1 + "\n## 逐章概要\n" + "\n".join(f"第 {i} 章：{p}{i} —— 概要" for i, p in [(1, "风"), (20, "风"), (50, "云"), (90, "归")])
+    # 卷1(1-34章)写第20章：总述按卷切分后不含卷2/卷3概要
+    r = wf._extract_relevant_outline(
+        outline, 20, capture_range=2, spoiler_level="none",
+        current_volume={"start": 1, "end": 34})
+    assert "风起" in r            # 卷1概要保留
+    assert "云涌" not in r        # 卷2概要不泄漏
+    assert "归一" not in r        # 卷3概要不泄漏
+    # 不传 current_volume（旧行为）：仍保留全部总述
+    r0 = wf._extract_relevant_outline(outline, 20, capture_range=2, spoiler_level="none")
+    assert "云涌" in r0 and "归一" in r0
+
+
+def test_generate_volume_chapters_force_replaces_and_scopes():
+    """force=True 重新生成：整体替换该卷旧细纲，且卷级总述按卷切分（不混入后续卷）"""
+    seen = {}
+
+    class CaptureAPI(FakeAPI):
+        def generate(self, prompt, step="", **kw):
+            self.prompts.append(prompt)
+            seen["prompt"] = prompt
+            return "\n".join(f"第 {i} 章：新{i} —— 概要" for i in range(1, 35))
+
+    wf = FullNovelWorkflow(CaptureAPI([STAGE1]), FakeVS())
+    wf.novel_info["outline"] = STAGE1 + "\n## 逐章概要\n### 第一卷：风起\n" + "\n".join(
+        f"第 {i} 章：旧{i} —— 概要" for i in range(1, 35)) + "\n### 第二卷：云涌\n第 35 章：云35 —— 概要"
+    wf.novel_info["volume_plan"] = [
+        {"index": 1, "name": "第一卷：风起", "start": 1, "end": 34, "plot": "开局", "chapters_done": True},
+        {"index": 2, "name": "第二卷：云涌", "start": 35, "end": 67, "plot": "发展", "chapters_done": False},
+    ]
+    # force=False 时已生成卷跳过
+    assert wf.generate_volume_chapters(1) is None
+    # force=True 强制重新生成
+    res = wf.generate_volume_chapters(1, force=True)
+    assert res is not None
+    # 卷1细纲 prompt 按卷切分，不含卷2「云涌」概要
+    assert "云涌" not in seen["prompt"]
+    assert "风起" in seen["prompt"]
+    # 大纲中卷1细纲被整体替换（旧条目消失），且卷2小节完整保留
+    o = wf.novel_info["outline"]
+    assert "旧1" not in o and "新1" in o
+    assert o.count("### 第一卷：风起") == 1
+    assert "第 35 章：云35 —— 概要" in o  # 卷2细纲未受影响

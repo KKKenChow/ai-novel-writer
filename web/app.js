@@ -56,7 +56,7 @@ const STEP_NAMES = {
   continue: "续写", polish: "润色", chapter_review: "章节评审", chapter_revise: "章节改写",
   style_fingerprint: "文风指纹", humanize: "去AI腔", batch_chapters: "批量生成",
   consistency: "一致性检查", relation_graph: "角色图谱", distill: "技能蒸馏",
-  extend_outline: "扩展大纲", volume_chapters: "卷逐章概要", rewrite_outline: "局部改写大纲",
+  extend_outline: "扩展大纲", volume_chapters: "逐章概要", rewrite_outline: "局部改写大纲",
   migrate_cards: "迁移角色卡", memory_rebuild: "重建台账", rewrite_preview: "改写建议预览",
 };
 
@@ -736,14 +736,7 @@ function tabCharacters(root) {
       return { prompt: p, num_main: +w.querySelector("#num-main").value, num_support: +w.querySelector("#num-support").value };
     },
   }));
-  if (S.novel.characters) {
-    root.append(editableContent({
-      title: "人物设定", content: S.novel.characters,
-      type: "character", sectionTitle: "all_characters",
-      originalKey: "characters_original", promptKey: "characters_prompt",
-    }));
-  }
-  // TODO 2.4：角色卡编辑器（放在既有生成/自由文本区之后，作为增强而非替换）
+  // 角色卡编辑器（结构化模式唯一视图；旧版自由文本小说会在其中提示迁移）
   renderCharacterCards(root);
 }
 
@@ -760,12 +753,15 @@ async function renderCharacterCards(root) {
     return;
   }
   const { cards, mode, has_freetext } = data;
-  box.innerHTML = `<h4>🗂️ 角色卡（${mode === "structured" ? `共 ${cards.length} 张` : "自由文本模式"}）</h4>
-    <div class="caption">角色卡按登场/退场章节精确注入章节生成；保存后自动同步渲染为自由文本人物设定。</div>`;
+  box.innerHTML = `<h4>🗂️ 角色卡（${mode === "structured" ? `共 ${cards.length} 张` : "暂未创建角色卡"}）</h4>
+    <div class="caption">点击角色块查看/编辑详情。各环节读取规则：<br>
+      · 大纲：注入全部角色卡（不设上限）<br>
+      · 卷逐章概要：按本卷章节区间过滤，只注入本卷登场角色<br>
+      · 章节正文 / 章节评审：按登场/退场章过滤，只注入本章在场角色</div>`;
 
   if (mode !== "structured") {
-    // freetext 模式：提示 + AI 迁移入口
-    box.innerHTML += `<div class="msg info">当前为自由文本模式。可由 AI 一次性解析为角色卡（解析可能丢失细节，请核对预览）。</div>`;
+    // 旧版自由文本小说：一次性的迁移入口（card-only 模式下不提供自由文本编辑）
+    box.innerHTML += `<div class="msg info">检测到旧版自由文本人物设定。建议先由 AI 一次性整理为角色卡（解析可能丢失细节，请核对预览后再确认）。</div>`;
     if (has_freetext) {
       const migBtn = el("button", "btn primary", "🔄 AI 迁移为角色卡");
       migBtn.style.marginTop = "8px";
@@ -773,7 +769,7 @@ async function renderCharacterCards(root) {
         if (!confirm("AI 解析可能丢失细节，迁移前会展示预览供核对。继续？")) return;
         runGeneration("migrate_cards", {}, {
           onDone: (r) => {
-            if (!r.preview) { alertMsg("error", "迁移解析失败，已保持自由文本模式"); return; }
+            if (!r.preview) { alertMsg("error", "迁移解析失败，请重试或先检查人物设定"); return; }
             renderMigrationPreview(box, r.preview);
           },
         });
@@ -783,8 +779,11 @@ async function renderCharacterCards(root) {
     return;
   }
 
-  // structured 模式：卡片编辑列表
-  const list = el("div");
+  // 多宫格 + 点开详情（card-only 结构化模式唯一视图）
+  const grid = el("div", "card-grid");
+  const detail = el("div", "card-detail");
+  let selected = -1;
+
   const newCard = () => ({ name: "", role: "support", identity: "", personality: "",
     relationships: "", appearance_chapter: 1, exit_chapter: null, notes: "" });
 
@@ -795,60 +794,84 @@ async function renderCharacterCards(root) {
     return w;
   };
 
-  const renderCards = () => {
-    list.innerHTML = "";
+  const roleLabel = (r) => (r === "main" ? "主角" : "配角");
+
+  const renderGrid = () => {
+    grid.innerHTML = "";
     cards.forEach((c, i) => {
-      const card = el("div", "box");
-      card.style.marginTop = "8px";
-      const head = el("div", "row");
-      head.innerHTML = `<b class="shrink" style="align-self:center">#${i + 1} ${esc(c.name || "（未命名）")}</b>`;
-      const delBtn = el("button", "btn small shrink", "🗑️ 删除");
-      delBtn.onclick = () => { if (confirm(`删除角色卡「${c.name || "#" + (i + 1)}」？`)) { cards.splice(i, 1); renderCards(); } };
-      head.append(delBtn);
-      card.append(head);
-
-      const nameI = el("input"); nameI.type = "text"; nameI.value = c.name || ""; nameI.placeholder = "角色姓名";
-      nameI.oninput = () => { c.name = nameI.value; head.querySelector("b").textContent = `#${i + 1} ${c.name || "（未命名）"}`; };
-      const roleSel = el("select");
-      roleSel.innerHTML = `<option value="main" ${c.role === "main" ? "selected" : ""}>主角</option>
-        <option value="support" ${c.role !== "main" ? "selected" : ""}>配角</option>`;
-      roleSel.onchange = () => { c.role = roleSel.value; };
-      const r1 = el("div", "row");
-      r1.append(fieldRow("姓名", nameI), fieldRow("类型", roleSel));
-      card.append(r1);
-
-      const idI = el("input"); idI.type = "text"; idI.value = c.identity || ""; idI.placeholder = "如：青云宗外门弟子";
-      idI.oninput = () => { c.identity = idI.value; };
-      const persI = el("input"); persI.type = "text"; persI.value = c.personality || ""; persI.placeholder = "如：冷静理智、外冷内热";
-      persI.oninput = () => { c.personality = persI.value; };
-      const r2 = el("div", "row");
-      r2.append(fieldRow("身份", idI), fieldRow("性格", persI));
-      card.append(r2);
-
-      const relI = el("input"); relI.type = "text"; relI.value = c.relationships || ""; relI.placeholder = "如：与张三为师徒，与李四为敌";
-      relI.oninput = () => { c.relationships = relI.value; };
-      const appI = el("input"); appI.type = "number"; appI.min = "1"; appI.value = c.appearance_chapter || 1;
-      appI.oninput = () => { c.appearance_chapter = +appI.value || 1; };
-      const exitI = el("input"); exitI.type = "number"; exitI.min = "1"; exitI.placeholder = "留空=不退场";
-      if (c.exit_chapter) exitI.value = c.exit_chapter;
-      exitI.oninput = () => { c.exit_chapter = exitI.value ? +exitI.value : null; };
-      const r3 = el("div", "row");
-      r3.append(fieldRow("人物关系", relI), fieldRow("登场章节", appI), fieldRow("退场章节", exitI));
-      card.append(r3);
-
-      const notesI = el("input"); notesI.type = "text"; notesI.value = c.notes || ""; notesI.placeholder = "其他备注（可选）";
-      notesI.oninput = () => { c.notes = notesI.value; };
-      card.append(fieldRow("备注", notesI));
-      list.append(card);
+      const cell = el("div", "card-cell" + (i === selected ? " selected" : ""));
+      const role = c.role === "main" ? "main" : "support";
+      cell.innerHTML = `<div class="card-cell-name">${esc(c.name || "（未命名）")}</div>
+        <span class="card-badge ${role}">${roleLabel(c.role)}</span>
+        <div class="card-cell-sub">登场·第${c.appearance_chapter || 1}章${c.exit_chapter ? ` → 第${c.exit_chapter}章退场` : ""}</div>
+        <div class="card-cell-preview">${esc((c.identity || c.personality || "点击编辑详情…").slice(0, 40))}</div>`;
+      cell.onclick = () => select(i);
+      grid.append(cell);
     });
+    const addCell = el("div", "card-cell card-empty");
+    addCell.innerHTML = `<div style="text-align:center;opacity:.7">➕<br>新增角色</div>`;
+    addCell.onclick = () => { cards.push(newCard()); select(cards.length - 1); };
+    grid.append(addCell);
   };
-  renderCards();
-  box.append(list);
+
+  const renderDetail = (i) => {
+    detail.innerHTML = "";
+    if (i < 0 || i >= cards.length) return;
+    const c = cards[i];
+    const head = el("div", "row");
+    head.innerHTML = `<b class="shrink" style="align-self:center">✏️ 编辑 #${i + 1}</b>`;
+    const delBtn = el("button", "btn small shrink", "🗑️ 删除本角色");
+    delBtn.onclick = () => {
+      if (!confirm(`删除角色卡「${c.name || "#" + (i + 1)}」？`)) return;
+      cards.splice(i, 1);
+      selected = -1;
+      renderGrid();
+      renderDetail(-1);
+    };
+    head.append(delBtn);
+    detail.append(head);
+
+    const nameI = el("input"); nameI.type = "text"; nameI.value = c.name || ""; nameI.placeholder = "角色姓名（必填）";
+    nameI.oninput = () => { c.name = nameI.value; const cell = grid.children[i]; if (cell) cell.querySelector(".card-cell-name").textContent = c.name || "（未命名）"; };
+    const roleSel = el("select");
+    roleSel.innerHTML = `<option value="main" ${c.role === "main" ? "selected" : ""}>主角</option>
+      <option value="support" ${c.role !== "main" ? "selected" : ""}>配角</option>`;
+    roleSel.onchange = () => { c.role = roleSel.value; renderGrid(); renderDetail(i); };
+    const r1 = el("div", "row");
+    r1.append(fieldRow("姓名", nameI), fieldRow("类型", roleSel));
+    detail.append(r1);
+
+    const idI = el("input"); idI.type = "text"; idI.value = c.identity || ""; idI.placeholder = "如：青云宗外门弟子";
+    idI.oninput = () => { c.identity = idI.value; };
+    const persI = el("input"); persI.type = "text"; persI.value = c.personality || ""; persI.placeholder = "如：冷静理智、外冷内热";
+    persI.oninput = () => { c.personality = persI.value; };
+    const r2 = el("div", "row");
+    r2.append(fieldRow("身份", idI), fieldRow("性格", persI));
+    detail.append(r2);
+
+    const relI = el("input"); relI.type = "text"; relI.value = c.relationships || ""; relI.placeholder = "如：与张三为师徒，与李四为敌";
+    relI.oninput = () => { c.relationships = relI.value; };
+    const appI = el("input"); appI.type = "number"; appI.min = "1"; appI.value = c.appearance_chapter || 1;
+    appI.oninput = () => { c.appearance_chapter = +appI.value || 1; };
+    const exitI = el("input"); exitI.type = "number"; exitI.min = "1"; exitI.placeholder = "留空=不退场";
+    if (c.exit_chapter) exitI.value = c.exit_chapter;
+    exitI.oninput = () => { c.exit_chapter = exitI.value ? +exitI.value : null; };
+    const r3 = el("div", "row");
+    r3.append(fieldRow("人物关系", relI), fieldRow("登场章节", appI), fieldRow("退场章节", exitI));
+    detail.append(r3);
+
+    const notesI = el("input"); notesI.type = "text"; notesI.value = c.notes || ""; notesI.placeholder = "其他备注（可选）";
+    notesI.oninput = () => { c.notes = notesI.value; };
+    detail.append(fieldRow("备注", notesI));
+  };
+
+  const select = (i) => { selected = i; renderGrid(); renderDetail(i); };
+  select(0);
+
+  box.append(grid, detail);
 
   const ops = el("div", "row");
-  ops.style.marginTop = "8px";
-  const addBtn = el("button", "btn small shrink", "➕ 新增角色");
-  addBtn.onclick = () => { cards.push(newCard()); renderCards(); };
+  ops.style.marginTop = "10px";
   const saveBtn = el("button", "btn primary small shrink", "💾 保存角色卡");
   saveBtn.onclick = async () => {
     const clean = cards.filter(c => (c.name || "").trim());
@@ -869,18 +892,8 @@ async function renderCharacterCards(root) {
       refreshNovel(true);
     } catch (e) { alertMsg("error", e.message); }
   };
-  ops.append(addBtn, saveBtn);
+  ops.append(saveBtn);
   box.append(ops);
-
-  const backBtn = el("button", "btn small", "↩️ 切换回自由文本模式");
-  backBtn.style.marginTop = "6px";
-  backBtn.onclick = async () => {
-    if (!confirm("切换回自由文本模式？角色卡将被删除（已渲染的自由文本人物设定保留）。")) return;
-    await api(`/api/novels/${encodeURIComponent(S.novelId)}/character_cards`, { method: "DELETE" });
-    alertMsg("success", "已切换回自由文本模式");
-    refreshNovel(true);
-  };
-  box.append(backBtn);
 }
 
 /* TODO 2.2：AI 迁移预览——确认后才 PUT 入库 */
@@ -962,11 +975,11 @@ function renderOutlineExtra(root) {
   extRow.append(extBtn);
   box.append(extRow);
 
-  // TODO 3.2：卷逐章概要手动提前生成（章节生成遇到无概要的卷也会自动生成）
+  // TODO 3.2：逐章概要手动提前生成（章节生成遇到无概要的卷也会自动生成）
   const vp = extra("volume_plan", null);
   if (Array.isArray(vp) && vp.length) {
     const volWrap = el("div");
-    volWrap.innerHTML = `<label class="field" style="margin-top:10px">📚 卷逐章概要</label>
+    volWrap.innerHTML = `<label class="field" style="margin-top:10px">📚 逐章概要</label>
       <div class="caption">每卷各章的一句话概要。章节生成遇到无概要的卷时会自动生成，此处可提前手动生成。</div>`;
     for (const v of vp) {
       const row = el("div", "row");
@@ -976,6 +989,15 @@ function renderOutlineExtra(root) {
         const b = el("button", "btn small shrink", "生成该卷概要");
         b.onclick = () => runGeneration("volume_chapters", { volume_index: v.index }, { onDone: () => refreshNovel(true) });
         row.append(b);
+      } else {
+        // 已生成概要的卷：允许重新生成（替换旧细纲，写入时按卷切分不再混入后续卷内容）
+        const rb = el("button", "btn small shrink", "🔄 重新生成概要");
+        rb.style.marginLeft = "6px";
+        rb.onclick = () => {
+          if (!confirm(`将重新生成「${v.name || `第${v.index}卷`}」的逐章概要并替换旧内容。继续？`)) return;
+          runGeneration("volume_chapters", { volume_index: v.index, force: true }, { onDone: () => refreshNovel(true) });
+        };
+        row.append(rb);
       }
       volWrap.append(row);
     }

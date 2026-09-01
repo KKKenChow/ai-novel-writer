@@ -254,3 +254,24 @@ label.field { display: block; margin: 10px 0 4px; color: var(--fg-dim); font-siz
 
 /* TODO 2.2/4.2：迁移/改写建议的可滚动预览区 */
 .preview-scroll { max-height: 320px; overflow-y: auto; }
+
+/* ---------- 角色卡多宫格 ---------- */
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; margin: 10px 0; }
+.card-cell {
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+  cursor: pointer; background: var(--bg3); position: relative; transition: outline-color .1s;
+}
+.card-cell:hover { border-color: var(--accent); }
+.card-cell.selected { outline: 2px solid var(--accent); }
+.card-cell-name { font-weight: 700; font-size: 14px; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-badge { font-size: 11px; padding: 1px 8px; border-radius: 10px; display: inline-block; }
+.card-badge.main { background: rgba(79,195,247,.15); border: 1px solid var(--accent); color: var(--accent); }
+.card-badge.support { background: rgba(255,202,40,.12); border: 1px solid var(--yellow); color: var(--yellow); }
+.card-cell-sub { font-size: 11px; color: var(--fg-dim); margin-top: 5px; }
+.card-cell-preview { font-size: 12px; color: var(--fg-dim); margin-top: 6px; line-height: 1.5; }
+.card-empty { display: flex; align-items: center; justify-content: center; color: var(--fg-dim); font-size: 13px; border-style: dashed; min-height: 78px; }
+.card-detail {
+  border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+  background: var(--bg2); margin: 4px 0 10px;
+}
+.card-detail:empty { display: none; }

@@ -194,6 +194,30 @@ def test_appearance_filtered_injection():
     assert "隐世高人" not in ctx300["context_text"]
 
 
+# ---------- 角色卡按卷区间过滤（大纲/卷细纲注入） ----------
+
+def test_filter_cards_for_range():
+    cards, _ = cc.parse_character_cards(TAGGED)  # 叶凡登场1不退场；玄机子登场160退场280
+    def names(seq): return [c["name"] for c in seq]
+    assert names(cc.filter_cards_for_range(cards, 1, 40)) == ["叶凡"]
+    assert names(cc.filter_cards_for_range(cards, 150, 170)) == ["叶凡", "玄机子"]
+    assert names(cc.filter_cards_for_range(cards, 300, 320)) == ["叶凡"]
+
+
+def test_volume_chapters_injects_volume_characters():
+    """卷逐章细纲应注入本卷区间登场角色卡"""
+    wf = make_wf([TAGGED])
+    wf.save_character_cards(cc.parse_character_cards(TAGGED)[0])
+    plan = [{"index": 1, "start": 1, "end": 100, "name": "第一卷"},
+            {"index": 2, "start": 101, "end": 200, "name": "第二卷"}]
+    wf.novel_info["volume_plan"] = plan
+    wf.novel_info["outline"] = "故事主线：xxx"
+    out = wf._generate_single_volume_chapters({"start_chapter": 150, "end_chapter": 200,
+                                               "name": "第二卷", "plot": "决战"}, "卷级大纲", 4000)
+    joined = "".join(wf.api.prompts[-1])
+    assert "玄机子" in joined and "隐世高人" in joined   # 本卷登场角色注入
+
+
 # ---------- 3.1 extend_outline 增量扩展 ----------
 
 def test_extend_outline_appends_verbatim():

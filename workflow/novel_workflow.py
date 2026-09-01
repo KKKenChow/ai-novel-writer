@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 # AI 套话黑名单自定义词条的 extra_data key
 CUSTOM_BLACKLIST_KEY = "custom_cliche_blacklist"
 
+# 大纲内「逐章概要」小节的分节标记（曾用名「逐章大纲」，需兼容旧数据）
+VOLUME_CHAPTER_MARKER = "## 逐章概要"
+VOLUME_CHAPTER_MARKER_OLD = "## 逐章大纲"
+
 # AI 内容安全审查拒绝的关键词（拒绝内容不入库，避免污染本地存储）
 _REFUSAL_KEYWORDS = [
     "我不能按照你的要求进行创作",
@@ -215,6 +219,23 @@ class FullNovelWorkflow:
             self.novel_info["character_cards"] = cards
         return cards
 
+    def _character_section(self, limit: int = 4000, start_ch: Optional[int] = None,
+                           end_ch: Optional[int] = None) -> str:
+        """构建人物设定注入文本：优先从结构化角色卡生成（可按章节/卷区间过滤），
+        无卡片时回退到自由文本 characters。返回截断后的文本（空字符串表示无人物设定）。"""
+        text = ""
+        cards = self.load_character_cards()
+        if cards:
+            if start_ch is not None and end_ch is not None:
+                cards = cc.filter_cards_for_range(cards, start_ch, end_ch)
+            text = cc.cards_to_text(cards)
+        else:
+            text = self.novel_info.get("characters", "") or ""
+        text = (text or "").strip()
+        if text and limit and len(text) > limit:
+            text = text[:limit] + "..."
+        return text
+
     # ---------- 外部章节导入 / 手写章节（TODO 1.2 / 1.3） ----------
 
     def import_chapter(self, chapter_num: int, title: str, content: str):
@@ -245,9 +266,9 @@ class FullNovelWorkflow:
     
     def generate_outline(self, user_prompt: str, total_chapters: int = 50, words_per_chapter: int = 2000, max_tokens: int = 4000) -> str:
         """第三步：生成总体大纲（大章节量时自动分卷两阶段生成）"""
-        # 获取已有上下文
+        # 获取已有上下文：人物设定直接读角色卡（结构化），无卡时回退自由文本
         world_setting = self.novel_info.get("world_setting", "")
-        characters = self.novel_info.get("characters", "")
+        characters = self._character_section(limit=None)  # 大纲需完整角色卡，不设上限
         
         # 章节数较多时（>60），采用两阶段生成：先卷级大纲，再逐卷补全章节
         if total_chapters > 60:
@@ -383,7 +404,7 @@ class FullNovelWorkflow:
                 "end_chapter": v["end"],
             } for v in plan]
 
-        logger.info(f"共 {len(volumes)} 卷，惰性生成：本次只补全第一卷逐章细纲，后续卷按需生成（generate_volume_chapters）")
+        logger.info(f"共 {len(volumes)} 卷，惰性生成：本次只补全第一卷逐章概要，后续卷按需生成（generate_volume_chapters）")
 
         # 持久化卷计划（章节生成遇到无细纲的卷时按需自动生成，UI 也可手动提前触发）
         volume_plan = [{
@@ -393,10 +414,10 @@ class FullNovelWorkflow:
         } for i, v in enumerate(volumes)]
 
         # 先把卷级大纲作为基础
-        all_parts = [stage1_result, "\n\n---\n\n## 逐章大纲\n"]
+        all_parts = [stage1_result, f"\n\n---\n\n{VOLUME_CHAPTER_MARKER}\n"]
 
-        # 只生成第一卷的逐章细纲；卷间盲写问题由 generate_volume_chapters 解决
-        # （后续卷生成时注入前一卷逐章大纲 + 滚动摘要）
+        # 只生成第一卷的逐章概要；卷间盲写问题由 generate_volume_chapters 解决
+        # （后续卷生成时注入前一卷逐章概要 + 滚动摘要）
         vol_result = self._generate_single_volume_chapters(volumes[0], stage1_result, max_tokens)
         if vol_result:
             all_parts.append(f"### {volumes[0]['name']}\n{vol_result}\n\n")
@@ -410,9 +431,9 @@ class FullNovelWorkflow:
 
     def _generate_single_volume_chapters(self, vol: dict, stage1_result: str, max_tokens: int,
                                          prev_volume_detail: str = "") -> Optional[str]:
-        """为单卷生成逐章细纲（两阶段第二阶段 + 惰性补全共用）。
+        """为单卷生成逐章概要（两阶段第二阶段 + 惰性补全共用）。
 
-        prev_volume_detail: 前一卷的逐章大纲（惰性补全时注入，解决卷间盲写：
+        prev_volume_detail: 前一卷的逐章概要（惰性补全时注入，解决卷间盲写：
         写第 N 卷细纲时能看到第 N-1 卷的章节拆分和章末钩子，节奏/伏笔才能衔接）。
         失败重试 1 次；返回 None 表示彻底失败（调用方记录缺失，不影响其他卷）。
         生成后自动校验全局章号，模型从 1 重排时自动偏移改写。
@@ -420,13 +441,19 @@ class FullNovelWorkflow:
         vol_name = vol["name"]
         start_ch, end_ch = vol["start_chapter"], vol["end_chapter"]
         vol_chapters = end_ch - start_ch + 1
+        # 本卷登场角色：直接从角色卡按卷区间过滤注入（无卡时回退自由文本）
+        characters_brief = self._character_section(limit=2500, start_ch=start_ch, end_ch=end_ch)
+        characters_block = f"""
+【人物设定（本卷登场角色）】
+{characters_brief}
+""" if characters_brief else ""
         # max_tokens 按卷章数线性放大（每章约 80 tokens），上限取 API 允许值
         vol_max_tokens = min(
             max(max_tokens, vol_chapters * 80 + 500),
             getattr(self.api, "MAX_TOKENS_LIMIT", max_tokens)
         )
         prev_block = f"""
-【前一卷逐章大纲（用于衔接节奏与伏笔，不要重复其桥段）】
+【前一卷逐章概要（用于衔接节奏与伏笔，不要重复其桥段）】
 {prev_volume_detail[-3000:]}
 """ if prev_volume_detail else ""
 
@@ -440,7 +467,7 @@ class FullNovelWorkflow:
 本卷覆盖全书第 {start_ch}-{end_ch} 章（共 {vol_chapters} 章）
 该卷核心剧情：{vol.get('plot', '')}
 {prev_block}
-请为这 {vol_chapters} 章逐一写出简要内容（每章一句话概括）。
+{characters_block}请为这 {vol_chapters} 章逐一写出简要内容（每章一句话概括）。
 
 格式要求：
 第 X 章：章节标题 —— 一句话概括（约N字）
@@ -466,33 +493,45 @@ class FullNovelWorkflow:
         return self._renumber_volume_outline(vol_result, start_ch, end_ch)
 
     def _stage1_from_outline(self, outline: str) -> str:
-        """从已存大纲文本中截取卷级部分（"## 逐章大纲"标记之前的原文）"""
-        marker = "## 逐章大纲"
-        idx = outline.find(marker)
-        return outline[:idx].rstrip() if idx >= 0 else outline
+        """从已存大纲文本中截取卷级部分（逐章概要标记之前的原文）"""
+        marker = self._find_volume_chapter_marker(outline)
+        return outline[:marker].rstrip() if marker >= 0 else outline
 
-    def generate_volume_chapters(self, volume_index: int, max_tokens: int = 4000) -> Optional[str]:
-        """惰性生成指定卷的逐章细纲（TODO 3.2.0）。
+    def _find_volume_chapter_marker(self, outline: str) -> int:
+        """返回大纲中「逐章概要」小节标记的起始下标；兼容旧数据里的「逐章大纲」标记。
 
-        prompt 注入：卷级大纲 + 前一卷逐章大纲 + 滚动摘要（解决卷间盲写）。
-        细纲追加到大纲文本末尾对应卷之下；全局章号由 volume_plan 保证。
-        已生成过的卷直接跳过（返回 None）。返回追加的大纲文本片段或 None。
+        返回 -1 表示大纲中尚无该小节。
+        """
+        idx_new = outline.find(VOLUME_CHAPTER_MARKER)
+        idx_old = outline.find(VOLUME_CHAPTER_MARKER_OLD)
+        candidates = [i for i in (idx_new, idx_old) if i >= 0]
+        return min(candidates) if candidates else -1
+
+    def generate_volume_chapters(self, volume_index: int, max_tokens: int = 4000, force: bool = False) -> Optional[str]:
+        """惰性生成/重新生成指定卷的逐章概要（TODO 3.2.0）。
+
+        prompt 注入：卷级大纲（按卷切分，避免跨卷泄漏）+ 前一卷逐章概要 + 滚动摘要（解决卷间盲写）。
+        细纲写入大纲文本对应卷之下；全局章号由 volume_plan 保证。
+        已生成过的卷默认跳过（返回 None）；force=True 时强制重新生成并整体替换该卷旧细纲。
+        返回写入的大纲文本片段或 None。
         """
         plan = self.novel_info.get("volume_plan") or self.vs.load_extra_data("volume_plan", []) or []
         vol = next((v for v in plan if v.get("index") == volume_index), None)
         if not vol:
             logger.warning(f"volume_plan 中无第 {volume_index} 卷")
             return None
-        if vol.get("chapters_done"):
+        if vol.get("chapters_done") and not force:
             logger.info(f"第 {volume_index} 卷细纲已存在，跳过")
             return None
         outline = self.novel_info.get("outline", "") or self.vs.get_section("outline", "full_outline") or ""
         if not outline:
-            logger.warning("无大纲文本，无法惰性补全卷细纲")
+            logger.warning("无大纲文本，无法补全卷细纲")
             return None
 
         stage1_result = self._stage1_from_outline(outline)
-        # 前一卷逐章大纲 + 滚动摘要，解决卷间盲写
+        # 卷级总述按当前卷切分：只保留当前卷+前一卷概要，避免把后续卷内容喂给本卷细纲
+        stage1_result = self._slice_overview_by_volume(stage1_result, vol["start"])
+        # 前一卷逐章概要 + 滚动摘要，解决卷间盲写
         prev_detail = ""
         if volume_index > 1:
             prev = next((v for v in plan if v.get("index") == volume_index - 1), None)
@@ -511,17 +550,28 @@ class FullNovelWorkflow:
         if vol_result is None:
             return None
 
-        new_outline = outline.rstrip() + f"\n\n### {vol['name']}\n{vol_result}\n"
+        new_outline = self._upsert_volume_detail(outline, vol["name"], vol_result)
         self.vs.add_section("outline", "full_outline", new_outline)
         self.novel_info["outline"] = new_outline
         vol["chapters_done"] = True
         self.vs.save_extra_data("volume_plan", plan)
         self.novel_info["volume_plan"] = plan
-        logger.info(f"第 {volume_index} 卷细纲已惰性生成并追加入库")
+        logger.info(f"第 {volume_index} 卷细纲已{'重新生成并替换' if force else '生成并写入'}入库")
         return vol_result
 
+    def _upsert_volume_detail(self, outline: str, vol_name: str, new_text: str) -> str:
+        """把卷逐章概要写入大纲：若已存在同卷的「### 卷名」小节则整体替换，否则在末尾追加。
+        返回更新后的大纲全文。
+        """
+        esc = re.escape(vol_name)
+        pat = re.compile(rf'(###\s*{esc}[^\n]*\n).*?(?=\n###\s|$)', re.DOTALL)
+        m = pat.search(outline)
+        if m:
+            return outline[:m.start()] + m.group(1) + new_text.rstrip() + "\n" + outline[m.end():]
+        return outline.rstrip() + f"\n\n### {vol_name}\n{new_text}\n"
+
     def ensure_outline_for_chapter(self, chapter_num: int, max_tokens: int = 4000):
-        """章节生成前置保障：若该章所属卷尚无逐章细纲，自动惰性生成（TODO 3.2.0 触发时机）"""
+        """章节生成前置保障：若该章所属卷尚无逐章概要，自动惰性生成（TODO 3.2.0 触发时机）"""
         plan = self.novel_info.get("volume_plan") or self.vs.load_extra_data("volume_plan", []) or []
         if not plan:
             return
@@ -693,7 +743,7 @@ class FullNovelWorkflow:
         return "" if is_ai_refusal(result) else result
 
     def _renumber_volume_outline(self, vol_result: str, start_ch: int, end_ch: int) -> str:
-        """校验并修正单卷逐章大纲的章节号：
+        """校验并修正单卷逐章概要的章节号：
         - 若章节行数与卷章数一致但编号从 1 开始（模型无视全局编号），按顺序改写为 start_ch..end_ch；
         - 若编号已落在 [start_ch, end_ch] 区间内，原样返回；
         - 其他异常情况记告警并原样返回（不破坏文本）。
@@ -1219,10 +1269,13 @@ class FullNovelWorkflow:
         outline_for_chapter = ""
         if outline_text:
             effective_range = phase_config["outline_range"]
+            plan = self.novel_info.get("volume_plan") or self.vs.load_extra_data("volume_plan", []) or []
+            cur_vol = self._current_volume(plan, chapter_num)
             outline_for_chapter = self._extract_relevant_outline(
                 outline_text, chapter_num, 
                 capture_range=effective_range,
-                spoiler_level=spoiler_level
+                spoiler_level=spoiler_level,
+                current_volume=cur_vol
             )
             context_parts.append(f"【小说大纲（当前章节相关）】\n{outline_for_chapter}")
             logger.info(f"小说大纲: 原始{len(outline_text)}字 → 提取相关{len(outline_for_chapter)}字 (range=±{effective_range}, spoiler={spoiler_level})")
@@ -1348,7 +1401,7 @@ class FullNovelWorkflow:
         logger.info(f"===== generate_chapter 开始 =====")
         logger.info(f"参数: chapter_num={chapter_num}, chapter_title={chapter_title}, max_tokens={max_tokens}, target_words={target_words}, beats={'有' if beats else '无'}")
 
-        # 惰性细纲保障：当前章所属卷无逐章细纲时自动生成（TODO 3.2.0）
+        # 惰性细纲保障：当前章所属卷无逐章概要时自动生成（TODO 3.2.0）
         self.ensure_outline_for_chapter(chapter_num)
         if not chapter_title.strip():
             chapter_title = self.get_outline_chapter_titles().get(chapter_num, "")
@@ -2024,9 +2077,19 @@ class FullNovelWorkflow:
 
     def generate_chapter_beats(self, chapter_num: int, chapter_title: str, target_words: int = 2000, max_tokens: int = 2000) -> str:
         """生成章节细纲（场景卡）：3-6 个场景节拍，供用户编辑确认后按场景生成正文"""
+        # 前置保障：确保本章所属卷已有逐章概要，否则 _build_chapter_context 提取不到章节标记，
+        # 会兜底返回整本书卷级概览，导致第一章节拍就涵盖多章内容。
+        self.ensure_outline_for_chapter(chapter_num)
         if not target_words or target_words <= 0:
             target_words = self.resolve_target_words(chapter_num)
+        # 标题为空时从大纲补齐，确保场景节拍对齐到具体章节
+        if not chapter_title.strip():
+            chapter_title = self.get_outline_chapter_titles().get(chapter_num, "")
         ctx = self._build_chapter_context(chapter_num, chapter_title)
+        # 单独抽出本章那一行概要作为场景节拍的唯一大纲依据（capture_range=0 只取本章）
+        outline = self.novel_info.get("outline", "") or self.vs.get_section("outline", "full_outline") or ""
+        chapter_anchor = self._extract_relevant_outline(
+            outline, chapter_num, capture_range=0, spoiler_level="none") if outline else ""
         n_beats = min(6, max(3, target_words // 800))
         
         prompt = f"""你是一位专业的小说结构编辑。请为第 {chapter_num} 章 "{chapter_title}" 设计**场景细纲**（不是正文）。
@@ -2034,8 +2097,13 @@ class FullNovelWorkflow:
 {ctx["context_text"]}
 {ctx["phase_config"]["pacing_instruction"]}
 
+【本章大纲（唯一依据，场景节拍只围绕本章，不得覆盖后续章节）】
+{chapter_anchor or "（暂无本章大纲条目）"}
+
 【要求】
 - 把本章拆成 {n_beats} 个场景节拍，每个场景有可识别的地点/人物/冲突推进
+- 场景节拍内容**严格限定在第 {chapter_num} 章「{chapter_title}」概要描述的事件范围内**，只展开本章该发生的事
+- **严禁抢跑**：不要把后续章节才该出现的冲突、转折、角色提前放进本章节拍
 - 每个场景按以下格式输出（严格遵守，方便程序解析）：
 
 ## 场景1：场景名
@@ -2057,17 +2125,34 @@ class FullNovelWorkflow:
     
     def review_chapter(self, chapter_num: int, chapter_title: str, content: str, max_tokens: int = 2500) -> str:
         """AI 评审章节：多维度评分 + 问题清单 + 修改建议（商业化质量标准）"""
+        total = self._estimate_total_chapters()
+        pc = self._classify_chapter_phase(chapter_num, total)
+        plan = self.novel_info.get("volume_plan") or self.vs.load_extra_data("volume_plan", []) or []
+        cur_vol = self._current_volume(plan, chapter_num)
+
         outline_for_chapter = ""
         outline_text = self.novel_info.get("outline", "")
         if outline_text:
-            total = self._estimate_total_chapters()
-            pc = self._classify_chapter_phase(chapter_num, total)
             outline_for_chapter = self._extract_relevant_outline(
-                outline_text, chapter_num, capture_range=pc["outline_range"], spoiler_level="none")
-        
-        characters_brief = self.novel_info.get("characters", "")[:2000]
-        
+                outline_text, chapter_num, capture_range=pc["outline_range"],
+                spoiler_level="none", current_volume=cur_vol)
+
+        world_brief = self.novel_info.get("world_setting", "")[:2000]
+
+        # 人物：优先只注入当前章在场角色卡（与生成一致），无卡片时回退全文摘要
+        characters_brief = ""
+        cards = self.load_character_cards()
+        if cards:
+            active, _absent = cc.filter_cards_for_chapter(cards, chapter_num)
+            if active:
+                characters_brief = cc.cards_to_text(active)[:2000]
+        if not characters_brief:
+            characters_brief = self.novel_info.get("characters", "")[:2000]
+
         prompt = f"""你是一位极其严格的网文/出版编辑。请评审第 {chapter_num} 章 "{chapter_title}" 的正文质量。
+
+【世界观设定（摘要）】
+{world_brief}
 
 【人物设定（摘要）】
 {characters_brief}
@@ -2438,7 +2523,54 @@ class FullNovelWorkflow:
         
         return "；".join(warnings) if warnings else ""
 
-    def _extract_relevant_outline(self, outline: str, chapter_num: int, capture_range: int = 2, spoiler_level: str = "minimal") -> str:
+    def _current_volume(self, plan: list, chapter_num: int) -> Optional[dict]:
+        """从 volume_plan 中定位当前章节所属卷。返回卷 dict 或 None。
+        卷计划缺失/未匹配时返回 None（调用方回退到不按卷切分的现状）。
+        """
+        if not plan:
+            return None
+        for v in plan:
+            start = v.get("start") if v.get("start") is not None else v.get("start_chapter")
+            end = v.get("end") if v.get("end") is not None else v.get("end_chapter")
+            if start is not None and end is not None and start <= chapter_num <= end:
+                return v
+        return None
+
+    def _slice_overview_by_volume(self, overview_text: str, chapter_num: int) -> str:
+        """把大纲总述中的 [卷]...[/卷] 块按当前章节卷切分：只保留「故事主线」+
+        当前卷 + 前一卷块，丢弃后续卷块，避免跨卷信息泄漏到当前章节的生成/审阅。
+        无 [卷] 块或无法定位当前卷时原样返回（安全兜底）。
+        """
+        if not overview_text or not overview_text.strip():
+            return overview_text
+        blocks = list(re.finditer(r'\[卷\](.*?)\[/卷\]', overview_text, re.DOTALL))
+        if not blocks:
+            return overview_text
+        spans = []
+        for m in blocks:
+            s_ch, e_ch = None, None
+            ch = re.search(r'章节[：:]\s*(?:第)?\s*(\d+)\s*[-–—]\s*(?:第)?\s*(\d+)\s*章?', m.group(1))
+            if ch:
+                s_ch, e_ch = int(ch.group(1)), int(ch.group(2))
+            spans.append((m, s_ch, e_ch))
+        cur_idx = None
+        for i, (m, s, e) in enumerate(spans):
+            if s is not None and e is not None and s <= chapter_num <= e:
+                cur_idx = i
+                break
+        if cur_idx is None:
+            return overview_text
+        keep_indices = {cur_idx, cur_idx - 1}
+        parts, pos = [], 0
+        for i, (m, s, e) in enumerate(spans):
+            parts.append(overview_text[pos:m.start()])
+            if i in keep_indices:
+                parts.append(m.group(0))
+            pos = m.end()
+        parts.append(overview_text[pos:])
+        return "".join(parts)
+
+    def _extract_relevant_outline(self, outline: str, chapter_num: int, capture_range: int = 2, spoiler_level: str = "minimal", current_volume: Optional[dict] = None) -> str:
         """从大纲中提取当前章节附近的内容
         
         参数：
@@ -2451,6 +2583,8 @@ class FullNovelWorkflow:
           moderate → 总述部分过滤重大剧透
           minimal → 总述部分只过滤结局性剧透
           none → 总述部分不过滤
+        - current_volume: 当前章节所属卷（可选）。提供时总述中的 [卷] 块按卷切分，
+          只保留当前卷+前一卷，丢弃后续卷，防止跨卷信息泄漏。为 None 时保留全部总述。
         """
         lines = outline.split("\n")
         has_chapter_markers = any(self._match_chapter_num(l) > 0 for l in lines)
@@ -2480,15 +2614,21 @@ class FullNovelWorkflow:
             # 严格模式：完全不包含总述（总述往往概括全书走向）
             filtered_overview = []
         elif spoiler_level in ("moderate", "minimal"):
-            # 中等/最小模式：对总述部分做剧透句子过滤
+            # 中等/最小模式：对总述部分做剧透句子过滤（若指定当前卷，先按卷切分）
             overview_text = "\n".join(overview_lines)
+            if current_volume:
+                overview_text = self._slice_overview_by_volume(overview_text, chapter_num)
             if overview_text.strip():
                 filtered_overview_text = self._strip_spoiler_sentences(overview_text, level=spoiler_level)
                 if filtered_overview_text.strip():
                     filtered_overview = [filtered_overview_text]
         else:
-            # none: 保留完整总述
-            filtered_overview = overview_lines
+            # none: 保留完整总述（若指定当前卷，则按卷切分防跨卷泄漏）
+            if current_volume:
+                overview_text = self._slice_overview_by_volume("\n".join(overview_lines), chapter_num)
+                filtered_overview = [overview_text] if overview_text.strip() else []
+            else:
+                filtered_overview = overview_lines
         
         # 提取章节范围内的大纲行
         relevant_lines = []

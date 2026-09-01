@@ -346,11 +346,12 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             result_payload["appended"] = appended
 
         elif step == "volume_chapters":
-            # TODO 3.2.0：手动提前触发指定卷的逐章细纲惰性生成
+            # TODO 3.2.0：手动提前触发/重新生成指定卷的逐章概要
             volume_index = int(params.get("volume_index", 0))
-            vol_result = workflow.generate_volume_chapters(volume_index, max_tokens=mt)
+            force = bool(params.get("force", False))
+            vol_result = workflow.generate_volume_chapters(volume_index, max_tokens=mt, force=force)
             if vol_result is None:
-                raise ValueError("该卷细纲已存在或卷号无效")
+                raise ValueError("该卷细纲已存在（如需重写请用「重新生成概要」）或卷号无效")
             result_payload["result"] = vol_result
 
         elif step == "rewrite_outline":
