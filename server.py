@@ -950,19 +950,57 @@ def create_blank_chapter(novel_id: str, body: dict):
 
 @app.get("/api/novels/{novel_id}/memory/status")
 def memory_status(novel_id: str):
-    """台账/摘要状态：stale 标记（有章节变动但 delta 未重算）与 delta 覆盖范围"""
+    """台账/摘要状态：stale 标记、delta 覆盖范围、伏笔回收统计、人工修正层"""
     store = get_store(novel_id)
     deltas = store.load_extra_data("ledger_deltas", {}) or {}
     ledger = store.load_extra_data("state_ledger", {}) or {}
     # 台账是否有实质内容（rebuild 会产生空壳 {"characters": [], ...}，不算有台账）
     has_ledger = any(ledger.get(k) for k in ("characters", "timeline", "foreshadowing"))
+    fs = [f for f in ledger.get("foreshadowing", []) if isinstance(f, dict)]
+    now = max([int(k) for k in deltas], default=0)
     return {
         "ledger_stale": bool(store.load_extra_data("ledger_stale", False)),
         "ledger_stale_from": store.load_extra_data("ledger_stale_from", None),
         "delta_chapters": sorted(int(k) for k in deltas),
         "has_ledger": has_ledger,
-        "has_summary": bool(store.load_extra_data("rolling_summary", "")),
+        "has_summary": bool(store.load_extra_data("rolling_summary", "")
+                            or store.load_extra_data("rolling_summary_recent", "")),
+        "has_full_summary": bool(store.load_extra_data("rolling_summary_full", "")),
+        "foreshadowing": {
+            "total": len(fs),
+            "recovered": sum(1 for f in fs if f.get("status") == "已回收"),
+            "overdue": sum(1 for f in fs if f.get("status") != "已回收"
+                           and f.get("target_chapter") and int(f.get("target_chapter")) < now),
+        },
+        "manual_fixes": bool(store.load_extra_data("ledger_manual_fixes", {})),
     }
+
+
+class MemoryFixIn(BaseModel):
+    type: str
+    key: str
+    patch: dict = {}
+
+
+class MemoryClearIn(BaseModel):
+    deep: bool = False
+
+
+@app.post("/api/novels/{novel_id}/memory/fix")
+def memory_fix(novel_id: str, body: MemoryFixIn):
+    """写入人工修正层并立即应用（防 AI 重建覆盖人工修改）"""
+    if body.type not in ("character", "foreshadowing") or not (body.key or "").strip():
+        raise HTTPException(400, "type 必须为 character/foreshadowing，key 不能为空")
+    wf = get_store_workflow(novel_id)
+    merged = wf.apply_ledger_fix(body.type, body.key.strip(), body.patch or {})
+    return {"ok": True, "ledger": merged}
+
+
+@app.post("/api/novels/{novel_id}/memory/clear")
+def memory_clear(novel_id: str, body: MemoryClearIn):
+    """清空记忆：deep=False 保留按章快照（下次生成自动重建）；deep=True 彻底清空"""
+    wf = get_store_workflow(novel_id)
+    return wf.clear_memory(deep=body.deep)
 
 
 # ---------- 角色卡（TODO 2.x）与登场调度 / 回溯分析（TODO 4.x） ----------
@@ -1151,16 +1189,7 @@ def delete_skill(dir_name: str):
     return {"ok": True}
 
 
-@app.post("/api/skills/recommend")
-def recommend_skills(body: dict):
-    query = body.get("query", "")
-    novel_id = body.get("novel_id", "")
-    exclude = []
-    if novel_id:
-        states = skill_manager.get_skill_states(get_store(novel_id))
-        all_skills = skill_manager.list_skills()
-        exclude = [s["dir"] for s in all_skills if skill_manager.is_skill_enabled(s, states)]
-    return {"skills": skill_manager.recommend_skills(query, exclude_dirs=exclude)}
+
 
 
 @app.post("/api/skills/import")

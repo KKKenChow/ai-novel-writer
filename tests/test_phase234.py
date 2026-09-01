@@ -22,6 +22,8 @@ class FakeVS:
             self.extra.pop(k, None)
         else:
             self.extra[k] = v
+    def delete_extra_field(self, k):
+        self.extra.pop(k, None)
     def load_extra_data(self, k=None, default=None):
         return self.extra.get(k, default) if k else self.extra
 
@@ -34,6 +36,13 @@ class FakeAPI:
         self.prompts = []
     def generate(self, prompt, step="", **kw):
         self.prompts.append(prompt)
+        if "full_summary" in prompt:
+            return json.dumps({
+                "delta": {"characters": [{"name": "林凡", "status": "受伤"}],
+                          "timeline": [{"chapter": 1, "event": "进城"}],
+                          "foreshadowing": [{"item": "纸条", "planted_chapter": 1, "status": "未回收"}]},
+                "full_summary": "全书梗概：主角进城。",
+                "recent_summary": "近期摘要：主角进城，遇见师父。"}, ensure_ascii=False)
         return self.outputs.pop(0) if self.outputs else "默认。" * 50
 
 
@@ -93,10 +102,7 @@ def test_merge_ledger_foreshadowing_recycle():
 
 
 def test_update_state_ledger_persists():
-    delta = {"characters": [{"name": "林凡", "status": "受伤"}],
-             "timeline": [{"chapter": 1, "event": "进城"}],
-             "foreshadowing": [{"item": "纸条", "planted_chapter": 1, "status": "未回收"}]}
-    wf = make_wf([json.dumps(delta, ensure_ascii=False)])
+    wf = make_wf()
     ledger = wf.update_state_ledger(1, "正文内容")
     assert ledger["characters"][0]["name"] == "林凡"
     assert wf.vs.extra["state_ledger"]["foreshadowing"][0]["item"] == "纸条"
@@ -104,10 +110,16 @@ def test_update_state_ledger_persists():
 
 def test_update_state_ledger_bad_json_keeps_old():
     old = {"characters": [{"name": "甲", "status": "好"}], "timeline": [], "foreshadowing": []}
-    wf = make_wf(["这不是JSON"])
+
+    class BadAPI(FakeAPI):
+        def generate(self, prompt, step="", **kw):
+            self.prompts.append(prompt)
+            return "这不是JSON"
+    wf = FullNovelWorkflow(BadAPI(), FakeVS())
     wf.vs.extra["state_ledger"] = old
     ledger = wf.update_state_ledger(1, "正文")
-    assert ledger["characters"][0]["name"] == "甲"
+    assert ledger["characters"][0]["name"] == "甲"   # 失败保留旧值
+    assert wf.vs.extra["ledger_stale"] is True        # B4：失败标记待重建，不再静默
 
 
 def test_foreshadowing_recovery_warning():
@@ -120,13 +132,71 @@ def test_foreshadowing_recovery_warning():
     assert wf.foreshadowing_recovery_warning() == ""
 
 
+# ---------- 台账优化：人工修正层 / 分块配额 / 伏笔排序 / 清空 ----------
+
+def test_apply_ledger_fix_survives_rebuild():
+    """人工修正层：标记伏笔已回收后，rebuild 不会被 AI 重建覆盖"""
+    wf = make_wf()
+    wf.vs.extra["state_ledger"] = {"characters": [], "timeline": [], "foreshadowing": [
+        {"item": "纸条", "planted_chapter": 1, "status": "未回收"}]}
+    wf.vs.extra["ledger_deltas"] = {"1": {"foreshadowing": [
+        {"item": "纸条", "planted_chapter": 1, "status": "未回收"}]}}
+    merged = wf.apply_ledger_fix("foreshadowing", "纸条", {"status": "已回收"})
+    assert merged["foreshadowing"][0]["status"] == "已回收"
+    # 再重建：修正层仍生效
+    wf.rebuild_memory_from_deltas()
+    assert wf.vs.extra["state_ledger"]["foreshadowing"][0]["status"] == "已回收"
+
+
+def test_ledger_brief_quotas_and_ordering():
+    """A1 分块配额 + A2 活跃度排序 + B1 伏笔排序 + A3 里程碑事件"""
+    wf = make_wf()
+    wf.vs.extra["state_ledger"] = {
+        "characters": [
+            {"name": "沉睡甲", "status": "旧状态", "updated_chapter": 1},
+            {"name": "活跃乙", "status": "新状态", "updated_chapter": 20},
+        ],
+        "timeline": [
+            {"chapter": 3, "event": "埋纸条伏笔"},
+            {"chapter": 20, "event": "最近事件"},
+        ],
+        "foreshadowing": [
+            {"item": "远期", "planted_chapter": 3, "target_chapter": 90, "status": "未回收"},
+            {"item": "逾期", "planted_chapter": 3, "target_chapter": 18, "status": "未回收"},
+            {"item": "临近", "planted_chapter": 3, "target_chapter": 22, "status": "未回收"},
+        ],
+    }
+    brief = wf._ledger_brief(20, {"phase": "mid_dev"})
+    # A2：活跃角色排前面
+    assert brief.index("活跃乙") < brief.index("沉睡甲")
+    # B1：逾期伏笔最先出现
+    assert brief.index("逾期") < brief.index("临近") < brief.index("远期")
+    # A3：里程碑事件（埋纸条伏笔的第3章）也注入
+    assert "第3章" in brief
+
+
+def test_clear_memory_deep():
+    """C4：deep=False 保留按章快照；deep=True 彻底清空"""
+    wf = make_wf()
+    wf.vs.extra["ledger_deltas"] = {"1": {"characters": []}}
+    wf.vs.extra["state_ledger"] = {"characters": [{"name": "甲"}]}
+    wf.vs.extra["rolling_summary_recent"] = "摘要"
+    wf.vs.extra["ledger_manual_fixes"] = {"characters": {}}
+    wf.clear_memory(deep=False)
+    assert "state_ledger" not in wf.vs.extra
+    assert "ledger_deltas" in wf.vs.extra          # 快照保留
+    wf.clear_memory(deep=True)
+    assert "ledger_deltas" not in wf.vs.extra
+    assert "ledger_manual_fixes" not in wf.vs.extra
+
+
 # ---------- 3.3 滚动摘要 ----------
 
 def test_rolling_summary_update():
-    wf = make_wf(["主角进城，遇见师父。"])
+    wf = make_wf()
     s = wf.update_rolling_summary(1, "正文")
     assert "师父" in s
-    assert wf.vs.extra["rolling_summary"] == s
+    assert wf.vs.extra["rolling_summary_recent"] == s
 
 
 def test_rolling_summary_injected_in_context():

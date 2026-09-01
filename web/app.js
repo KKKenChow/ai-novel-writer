@@ -1339,7 +1339,8 @@ function renderChapterGenerator(root, bare = false) {
   // 场景节拍
   const beatsBox = el("div");
   beatsBox.innerHTML = `<label class="field">场景节拍（可选，提供时按场景逐段生成，质量更稳）</label>
-    <div class="caption">未保存时自动预填大纲逐章概要；保存后独立存储，大纲更新时会提示可重新预填。生成时系统会自动校验节拍是否点名了尚未登场的角色（实体时间锁），越界会自动重生成；也可用「🔍 校验节拍」按钮手动复查。</div>`;
+    <div class="caption">未保存时自动预填大纲逐章概要；保存后独立存储，大纲更新时会提示可重新预填。生成时系统会自动校验节拍是否点名了尚未登场的角色，越界会自动带问题定位重生成；也可用「🔍 校验节拍」手动复查。</div>
+    <div class="caption" style="opacity:.75">🔍 校验原理：纯程序比对（零 AI 成本、不调用模型）——把每个场景与「角色卡+登场章节」注册表逐词比对，发现尚未登场角色即标记越界，并列出场景原文与问题点供重生成参考。</div>`;
   const beatsTa = el("textarea"); beatsTa.rows = 5;
   beatsTa.placeholder = "可留空；点击「生成场景节拍」让 AI 规划 3-6 个场景";
   // 大纲概要更新提示条（默认隐藏）
@@ -1526,22 +1527,138 @@ function renderChapterGenerator(root, bare = false) {
 
 function renderMemoryPanel(root) {
   const ledger = extra("state_ledger");
-  const summary = extra("rolling_summary");
+  const summaryFull = extra("rolling_summary_full") || extra("rolling_summary");
+  const summaryRecent = extra("rolling_summary_recent");
   const ms = S.memoryStatus;
   // TODO 1.1：以 memory/status 为准判断是否渲染；status 不可用则回退旧逻辑
   if (ms && !ms.has_ledger && !ms.has_summary) return;
-  if (!ms && !ledger && !summary) return;
+  if (!ms && !ledger && !summaryFull) return;
   const det = el("details", "box");
+  det.open = true;
   det.innerHTML = `<summary><b>🧠 长篇记忆（伏笔台账 / 滚动摘要）</b></summary>`;
-  // TODO 1.1：有章节被重生成/编辑/导入时的 stale 提示
+
+  // ---- C5 健康面板 ----
+  const deltas = (ms && ms.delta_chapters) || [];
+  const fsw = (ms && ms.foreshadowing) || { total: 0, recovered: 0, overdue: 0 };
+  const health = el("div", "caption");
+  health.style.margin = "4px 0";
+  let htext = [];
+  if (deltas.length) htext.push(`delta 覆盖第 ${deltas[0]}-${deltas[deltas.length - 1]} 章（${deltas.length} 章）`);
+  else if (ms && ms.has_ledger) htext.push("delta 记录为空（仅合并态）");
+  if (ms && ms.has_full_summary) htext.push("全书梗概 ✓");
+  if (ms && ms.has_summary) htext.push("近期摘要 ✓");
+  if (fsw.total) htext.push(`伏笔回收 ${fsw.recovered}/${fsw.total}`);
+  if (fsw.overdue) htext.push(`⚠️ 逾期 ${fsw.overdue} 条`);
+  if (ms && ms.manual_fixes) htext.push("人工修正层 ✓");
+  health.textContent = htext.join(" · ") || "尚无记忆数据";
+  det.append(health);
+  // stale 提示
   if (ms && ms.ledger_stale) {
-    det.innerHTML += `<div class="msg warn">⚠️ 有章节被重生成/编辑/导入，第 ${ms.ledger_stale_from ?? 1} 章起的台账与摘要已标记待重建。</div>`;
+    const warn = el("div", "msg warn");
+    warn.textContent = `⚠️ 有章节被重生成/编辑/导入，第 ${ms.ledger_stale_from ?? 1} 章起的台账与摘要已标记待重建（下次生成章节前会自动补齐）。`;
+    det.append(warn);
   }
-  if (ledger) {
-    det.innerHTML += `<h4>伏笔与角色状态台账</h4><div class="content-view">${esc(typeof ledger === "string" ? ledger : JSON.stringify(ledger, null, 2))}</div>`;
+
+  // ---- 摘要展示（双通道） ----
+  if (summaryFull) {
+    const d1 = el("details");
+    d1.innerHTML = `<summary class="caption">📖 全书剧情梗概（长期记忆，不随篇幅丢失）</summary><div class="content-view">${esc(summaryFull)}</div>`;
+    det.append(d1);
   }
-  if (summary) {
-    det.innerHTML += `<h4>滚动摘要</h4><div class="content-view">${esc(summary)}</div>`;
+  if (summaryRecent) {
+    const d2 = el("details");
+    d2.innerHTML = `<summary class="caption">📖 近期剧情摘要</summary><div class="content-view">${esc(summaryRecent)}</div>`;
+    det.append(d2);
+  }
+
+  // ---- C2 角色状态台账（可编辑，写入人工修正层） ----
+  if (ledger && typeof ledger === "object") {
+    const chars = Array.isArray(ledger.characters) ? ledger.characters : [];
+    if (chars.length) {
+      const chBox = el("div");
+      chBox.innerHTML = `<h4>👥 角色状态台账（编辑后写入人工修正层，AI 重建不会覆盖）</h4>`;
+      for (const c of chars) {
+        const row = el("div", "row");
+        const upd = c.updated_chapter ? `（第${c.updated_chapter}章活跃）` : "";
+        row.innerHTML = `<span class="caption shrink" style="align-self:center;min-width:90px">${esc(c.name)}${upd}</span>`;
+        const st = el("span", "caption", esc(c.status || ""));
+        st.style.flex = "1";
+        const editBtn = el("button", "btn small shrink", "✏️ 编辑");
+        editBtn.onclick = async () => {
+          const v = prompt(`编辑「${c.name}」的当前状态：`, c.status || "");
+          if (v === null) return;
+          try {
+            await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/fix`, {
+              method: "POST", body: { type: "character", key: c.name, patch: { status: v.trim() } },
+            });
+            alertMsg("success", `已修正「${c.name}」状态`);
+            refreshNovel(true);
+          } catch (e) { alertMsg("error", `修正失败：${e.message}`); }
+        };
+        row.append(st, editBtn);
+        chBox.append(row);
+      }
+      det.append(chBox);
+    }
+
+    // ---- 剧情时间线（只读） ----
+    const tl = Array.isArray(ledger.timeline) ? ledger.timeline.slice(-12).reverse() : [];
+    if (tl.length) {
+      const tlBox = el("div");
+      tlBox.innerHTML = `<h4>🕐 剧情时间线（最近 12 条）</h4>`;
+      for (const t of tl) {
+        const row = el("div", "caption");
+        row.textContent = `第${t.chapter ?? "?"}章：${t.event || ""}`;
+        tlBox.append(row);
+      }
+      det.append(tlBox);
+    }
+
+    // ---- C3 伏笔看板 ----
+    const fs = Array.isArray(ledger.foreshadowing) ? ledger.foreshadowing : [];
+    if (fs.length) {
+      const now = deltas.length ? deltas[deltas.length - 1] : 0;
+      const pending = fs.filter((f) => f.status !== "已回收");
+      const recovered = fs.filter((f) => f.status === "已回收");
+      const overdue = pending.filter((f) => f.target_chapter && f.target_chapter < now);
+      const sortKey = (f) => {
+        const t = f.target_chapter || 0;
+        if (t && t < now) return 0;
+        if (t && t - now <= 5) return 1;
+        return 2;
+      };
+      pending.sort((a, b) => sortKey(a) - sortKey(b));
+      const fsBox = el("div");
+      fsBox.innerHTML = `<h4>🎣 伏笔看板（待回收 ${pending.length} · 已回收 ${recovered.length}${overdue.length ? ` · 逾期 ${overdue.length}` : ""}）</h4>`;
+      const mkRow = (f, markBtn) => {
+        const row = el("div", "row");
+        const label = el("span", "caption", `第${f.planted_chapter ?? "?"}章埋设${f.target_chapter ? ` → 目标第${f.target_chapter}章` : ""}：${esc(f.item)}`);
+        label.style.flex = "1";
+        row.append(label);
+        if (markBtn) {
+          const b = el("button", "btn small shrink", "✓ 标记已回收");
+          b.onclick = async () => {
+            try {
+              await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/fix`, {
+                method: "POST", body: { type: "foreshadowing", key: f.item, patch: { status: "已回收" } },
+              });
+              alertMsg("success", `已标记「${f.item}」回收`);
+              refreshNovel(true);
+            } catch (e) { alertMsg("error", `标记失败：${e.message}`); }
+          };
+          row.append(b);
+        }
+        return row;
+      };
+      const pBox = el("div");
+      pBox.innerHTML = `<span class="caption" style="font-weight:bold">待回收</span>`;
+      for (const f of pending) pBox.append(mkRow(f, true));
+      const rBox = el("div");
+      rBox.innerHTML = `<span class="caption" style="font-weight:bold">已回收</span>`;
+      for (const f of recovered) rBox.append(mkRow(f, false));
+      fsBox.append(pBox, rBox);
+      det.append(fsBox);
+    }
   }
 
   // TODO 1.1：手动重建台账与摘要（合并态零成本 / 逐章重算 delta 有 token 成本）
@@ -1556,24 +1673,37 @@ function renderMemoryPanel(root) {
     const from_chapter = +rb.querySelector("#rb-from").value || 1;
     runGeneration("memory_rebuild", { from_chapter, regen: false }, { onDone: () => refreshNovel(true) });
   };
-  const rbRegen = el("button", "btn small shrink", "🤖 逐章重算 delta（每章约2次API调用，有 token 成本）");
+  const rbRegen = el("button", "btn small shrink", "🤖 逐章重算 delta（每章约1次API调用，有 token 成本）");
   rbRegen.onclick = () => {
     const from_chapter = +rb.querySelector("#rb-from").value || 1;
-    if (!confirm(`将从第 ${from_chapter} 章起逐章重算 delta，每章约 2 次 API 调用，会产生 token 成本。确定？`)) return;
+    if (!confirm(`将从第 ${from_chapter} 章起逐章重算 delta，每章约 1 次 API 调用，会产生 token 成本。确定？`)) return;
     runGeneration("memory_rebuild", { from_chapter, regen: true }, { onDone: () => refreshNovel(true) });
   };
   rbRow.append(rbMerge, rbRegen);
   rb.append(rbRow);
   det.append(rb);
 
-  const clearBtn = el("button", "btn small", "🗑️ 清空长篇记忆");
-  clearBtn.style.marginTop = "6px";
-  clearBtn.onclick = async () => {
-    if (!confirm("清空伏笔台账和滚动摘要？后续章节将失去长期一致性辅助。")) return;
-    await delExtra("state_ledger"); await delExtra("rolling_summary");
-    refreshNovel(true);
+  // C4 清空按钮修正：清空展示（保留按章记录）/ 彻底清空（含按章记录）
+  const clearRow = el("div", "row");
+  clearRow.style.marginTop = "6px";
+  const clearSoft = el("button", "btn small", "🗑️ 清空展示（保留按章记录）");
+  clearSoft.onclick = async () => {
+    if (!confirm("只清空合并台账与当前摘要？按章记录（delta/摘要快照）会保留，下次生成章节时自动重建。")) return;
+    try {
+      await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/clear`, { method: "POST", body: { deep: false } });
+      refreshNovel(true);
+    } catch (e) { alertMsg("error", `清空失败：${e.message}`); }
   };
-  det.append(clearBtn);
+  const clearDeep = el("button", "btn small", "💀 彻底清空（含按章记录）");
+  clearDeep.onclick = async () => {
+    if (!confirm("彻底清空长篇记忆（含按章 delta/摘要快照/人工修正层）？后续章节将彻底失去长期一致性辅助，此操作不可逆。")) return;
+    try {
+      await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/clear`, { method: "POST", body: { deep: true } });
+      refreshNovel(true);
+    } catch (e) { alertMsg("error", `清空失败：${e.message}`); }
+  };
+  clearRow.append(clearSoft, clearDeep);
+  det.append(clearRow);
   root.append(det);
 }
 
@@ -2168,22 +2298,6 @@ function tabSkills(root) {
     <div id="skills-list">加载中…</div>`;
   root.append(box);
   loadSkillsList();
-
-  // 智能推荐
-  const recBox = el("div", "box");
-  recBox.innerHTML = `<h4>💡 智能推荐</h4>
-    <div class="row"><input type="text" id="rec-query" placeholder="描述你的写作需求，如：如何写好打斗场面">
-    <button class="btn small shrink" id="rec-btn">🔍 推荐</button></div>
-    <div id="rec-result"></div>`;
-  recBox.querySelector("#rec-btn").onclick = async () => {
-    const q = recBox.querySelector("#rec-query").value.trim();
-    if (!q) return;
-    const { skills } = await api("/api/skills/recommend", { method: "POST", body: { query: q, novel_id: S.novelId } });
-    $("#rec-result").innerHTML = skills.length
-      ? skills.map(s => `<div class="caption">• <b>${esc(s.name)}</b>（${esc(s.dir)}，适用：${(s.apply_to || []).join("/")}）</div>`).join("")
-      : `<div class="caption">没有匹配的技能包</div>`;
-  };
-  root.append(recBox);
 
   // 蒸馏
   const disBox = el("div", "box");

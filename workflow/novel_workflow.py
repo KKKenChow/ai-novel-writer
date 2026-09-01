@@ -1580,37 +1580,23 @@ class FullNovelWorkflow:
             logger.info("关键词检索补充: 无")
         
         # 4. 滚动全书摘要：长篇连载的长线记忆（Phase 3）
-        rolling_summary = self.vs.load_extra_data("rolling_summary", "") or ""
-        if rolling_summary and chapter_num > 1:
-            context_parts.append(f"【全书剧情摘要（截至上一章）】\n{rolling_summary[:1200]}")
-            logger.info(f"滚动摘要: 传入{min(len(rolling_summary),1200)}字")
-        
-        # 4b. 角色状态台账：每章花一次 LLM 调用维护，必须回注生成 prompt 才有价值
-        #     （精简为"名字: 状态"单行列表 + 最近 3 条时间线，截 800 字）
-        ledger = self.vs.load_extra_data("state_ledger", {}) or {}
-        ledger_lines = []
-        for c in ledger.get("characters", []):
-            if isinstance(c, dict) and c.get("name"):
-                ledger_lines.append(f"- {c['name']}: {c.get('status', '')}")
-        timeline = [t for t in ledger.get("timeline", []) if isinstance(t, dict)]
-        for t in timeline[-3:]:
-            ledger_lines.append(f"- 第{t.get('chapter', '?')}章: {t.get('event', '')}")
-        if ledger_lines:
-            ledger_brief = "\n".join(ledger_lines)
-            ledger_brief = ledger_brief[:800] + ("..." if len(ledger_brief) > 800 else "")
-            context_parts.append(f"【角色状态与近期事件台账】\n{ledger_brief}")
-            logger.info(f"台账注入: 角色{len(ledger.get('characters', []))}条, 时间线{min(3, len(timeline))}条")
-        
-        # 5. 待回收伏笔：mid_dev 起注入（该阶段节奏策略已要求"开始回收伏笔"），
-        #    mid_dev 只注入前 5 条省 token，后期注入前 10 条
-        phase = phase_config["phase"]
-        if phase in ("mid_dev", "late_dev", "climax", "resolution"):
-            pending = self._pending_foreshadowing()
-            if pending:
-                limit = 5 if phase == "mid_dev" else 10
-                lines = [f"- {f['item']}（第{f.get('planted_chapter','?')}章埋设）" for f in pending[:limit]]
-                context_parts.append("【待回收伏笔（本章应尽量回收或推进）】\n" + "\n".join(lines))
-                logger.info(f"伏笔注入[{phase}]: {min(len(pending), limit)}/{len(pending)} 条待回收")
+        # 4. 双摘要长线记忆（B6 分层）：全书梗概（早期信息长期保留）+ 近 N 章摘要（细节）
+        if chapter_num > 1:
+            summary_full = self.vs.load_extra_data("rolling_summary_full", "") or \
+                self.vs.load_extra_data("rolling_summary", "") or ""
+            summary_recent = self.vs.load_extra_data("rolling_summary_recent", "") or ""
+            if summary_recent:
+                context_parts.append(f"【近期剧情摘要（近N章）】\n{summary_recent[:500]}")
+                logger.info(f"近期摘要: 传入{min(len(summary_recent),500)}字")
+            if summary_full:
+                context_parts.append(f"【全书剧情梗概（截至上一章）】\n{summary_full[:300]}")
+                logger.info(f"全书梗概: 传入{min(len(summary_full),300)}字")
+
+        # 4b. 角色状态台账 + 近期事件 + 待回收伏笔（A1 分块配额 + A3 时间线分层 + B1 伏笔排序）
+        ledger_brief = self._ledger_brief(chapter_num, phase_config)
+        if ledger_brief:
+            context_parts.append(f"【角色状态与剧情台账】\n{ledger_brief}")
+            logger.info(f"台账注入: {len(ledger_brief)}字（分块配额）")
         
         # 6. 文风指纹：生成时锁定文风（Phase 2）
         fingerprint = self.vs.load_extra_data("style_fingerprint", "") or ""
@@ -1790,13 +1776,11 @@ class FullNovelWorkflow:
         # 保存到本地存储，方便后续章节检索
         self.vs.add_section("chapter", f"chapter_{chapter_num}", f"第{chapter_num}章 {chapter_title}\n{result}")
         
-        # Phase 3：章节生成后自动更新状态台账和滚动摘要（失败静默，不影响主流程）
+        # Phase 3：章节生成后自动更新记忆（台账 delta + 全书梗概 + 近期摘要，一次调用）
         # 重生成场景：先失效本章及之后的旧 delta（旧章引入的伏笔/状态随之撤销），再重新产出
         self.invalidate_memory_from(chapter_num)
-        self._report("正文完成，正在更新伏笔台账…")
-        self.update_state_ledger(chapter_num, result)
-        self._report("正在更新滚动摘要…")
-        self.update_rolling_summary(chapter_num, result)
+        self._report("正文完成，正在更新伏笔台账与摘要…")
+        self.update_memory(chapter_num, result)
         
         return result
     
@@ -2100,6 +2084,77 @@ class FullNovelWorkflow:
         fs = ledger.get("foreshadowing", [])
         return [f for f in fs if isinstance(f, dict) and f.get("status") != "已回收"]
 
+    def _ledger_brief(self, chapter_num: int, phase_config: dict = None, quotas: tuple = (400, 200, 200)) -> str:
+        """构建台账注入文本（正文生成与章节评审共用）。
+
+        A1 分块配额：角色状态/近期事件/待回收伏笔各自独立裁剪，互不挤占；
+        A2 活跃度排序：角色按最后活跃章降序，沉睡角色（占满配额前）自动省略；
+        A3 时间线分层：最近 3 条 + 伏笔埋设章事件（里程碑）；
+        B1 伏笔排序：逾期 > 临近（5 章内）> 远期，按 target_chapter 优先提醒。
+        """
+        ledger = self.vs.load_extra_data("state_ledger", {}) or {}
+        blocks = []
+        char_q, tl_q, fs_q = quotas
+
+        # 角色状态：按最后活跃章降序（A2）
+        chars = [c for c in ledger.get("characters", []) if isinstance(c, dict) and c.get("name")]
+        chars.sort(key=lambda c: int(c.get("updated_chapter") or 0), reverse=True)
+        char_lines, used = [], 0
+        for c in chars:
+            line = f"- {c['name']}: {c.get('status', '')}"
+            if used + len(line) > char_q:
+                break
+            char_lines.append(line)
+            used += len(line)
+        if char_lines:
+            blocks.append("【角色状态】\n" + "\n".join(char_lines))
+
+        # 近期事件 + 伏笔埋设章里程碑（A3）
+        timeline = [t for t in ledger.get("timeline", []) if isinstance(t, dict)]
+        recent = sorted(timeline, key=lambda t: t.get("chapter", 0))[-3:]
+        milestone_chs = {f.get("planted_chapter") for f in ledger.get("foreshadowing", [])
+                         if isinstance(f, dict) and f.get("planted_chapter")}
+        picked = list(recent)
+        for t in timeline:
+            if t.get("chapter") in milestone_chs and t not in picked:
+                picked.append(t)
+        picked.sort(key=lambda t: t.get("chapter", 0))
+        tl_lines, used = [], 0
+        for t in picked:
+            line = f"- 第{t.get('chapter', '?')}章: {t.get('event', '')}"
+            if used + len(line) > tl_q:
+                break
+            tl_lines.append(line)
+            used += len(line)
+        if tl_lines:
+            blocks.append("【近期剧情事件】\n" + "\n".join(tl_lines))
+
+        # 待回收伏笔：mid_dev 起注入，按目标章排序（B1）
+        phase = (phase_config or {}).get("phase", "")
+        if phase in ("mid_dev", "late_dev", "climax", "resolution"):
+            pending = self._pending_foreshadowing()
+            if pending:
+                now = chapter_num
+                def fs_key(f):
+                    t = f.get("target_chapter") or 0
+                    if t and t < now:
+                        return (0, -t)      # 逾期最优先
+                    if t and t - now <= 5:
+                        return (1, -t)      # 临近
+                    return (2, -t)          # 远期
+                pending.sort(key=fs_key)
+                fs_lines, used = [], 0
+                for f in pending:
+                    tail = f"，目标第{f.get('target_chapter')}章" if f.get("target_chapter") else ""
+                    line = f"- {f.get('item', '')}（第{f.get('planted_chapter', '?')}章埋设{tail}）"
+                    if used + len(line) > fs_q:
+                        break
+                    fs_lines.append(line)
+                    used += len(line)
+                if fs_lines:
+                    blocks.append("【待回收伏笔（本章应尽量回收或推进）】\n" + "\n".join(fs_lines))
+        return "\n\n".join(blocks)
+
     def foreshadowing_recovery_warning(self) -> str:
         """伏笔回收率告警：回收率低于 70% 时返回警告文本"""
         ledger = self.vs.load_extra_data("state_ledger", {}) or {}
@@ -2114,9 +2169,9 @@ class FullNovelWorkflow:
         return ""
 
     @staticmethod
-    def merge_ledger(old: dict, delta: dict) -> dict:
+    def merge_ledger(old: dict, delta: dict, chapter_num: int = None) -> dict:
         """合并状态台账增量（纯函数）：
-        - characters: 按 name 覆盖更新
+        - characters: 按 name 覆盖更新（附加 updated_chapter 记录最后活跃章，供活跃度排序）
         - timeline: 追加（按 chapter 去重）
         - foreshadowing: 按 item 覆盖更新（AI 回报"已回收"时更新状态）
         """
@@ -2127,7 +2182,10 @@ class FullNovelWorkflow:
             by_name = {c.get("name"): c for c in merged["characters"] if isinstance(c, dict)}
             for c in delta["characters"]:
                 if isinstance(c, dict) and c.get("name"):
-                    by_name[c["name"]] = {**by_name.get(c["name"], {}), **c}
+                    upd = {**by_name.get(c["name"], {}), **c}
+                    if chapter_num is not None:
+                        upd["updated_chapter"] = chapter_num
+                    by_name[c["name"]] = upd
             merged["characters"] = list(by_name.values())
 
         if isinstance(delta.get("timeline"), list):
@@ -2154,7 +2212,7 @@ class FullNovelWorkflow:
         避免旧的"覆盖式 merge 无法撤销"导致的台账漂移。
 
         upto_chapter: 只重建到该章为止（含），None 表示全部。
-        返回 (merged_ledger, rolling_summary)。
+        返回 (merged_ledger, summary_recent)。
         """
         deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
         merged = {"characters": [], "timeline": [], "foreshadowing": []}
@@ -2162,24 +2220,90 @@ class FullNovelWorkflow:
             if upto_chapter is not None and int(k) > upto_chapter:
                 continue
             if isinstance(deltas[k], dict):
-                merged = self.merge_ledger(merged, deltas[k])
+                merged = self.merge_ledger(merged, deltas[k], chapter_num=int(k))
+        # 应用人工修正层（rebuild 后调用，防 AI 重建覆盖人工修改）
+        merged = self._apply_ledger_fixes(merged)
         self.vs.save_extra_data("state_ledger", merged)
 
-        # rolling_summaries 存的是每章的"累计快照"，重建 = 取不超过 upto 的最新快照
-        summaries = self.vs.load_extra_data("rolling_summaries", {}) or {}
-        summary, best = "", -1
-        for k in summaries:
-            kn = int(k)
-            if upto_chapter is not None and kn > upto_chapter:
-                continue
-            if kn > best:
-                best, summary = kn, summaries[k]
-        if summary:
-            self.vs.save_extra_data("rolling_summary", summary)
-        elif best < 0:
-            self.vs.save_extra_data("rolling_summary", "")
-        logger.info(f"记忆重建完成: 台账角色{len(merged['characters'])}条, 摘要截至第{best}章")
-        return merged, summary
+        # 双摘要通道分别重建：rolling_summaries(近期) / rolling_summaries_full(全书梗概)
+        def _latest_snapshot(key: str, save_key: str) -> str:
+            snaps = self.vs.load_extra_data(key, {}) or {}
+            out, best = "", -1
+            for k in snaps:
+                kn = int(k)
+                if upto_chapter is not None and kn > upto_chapter:
+                    continue
+                if kn > best:
+                    best, out = kn, snaps[k]
+            if out:
+                self.vs.save_extra_data(save_key, out)
+            elif best < 0:
+                self.vs.save_extra_data(save_key, "")
+            return out
+
+        recent = _latest_snapshot("rolling_summaries", "rolling_summary_recent")
+        full = _latest_snapshot("rolling_summaries_full", "rolling_summary_full")
+        # 兼容旧数据：只有旧 rolling_summary（全书压缩）时，作为近期摘要兜底
+        if not recent:
+            legacy = self.vs.load_extra_data("rolling_summary", "") or ""
+            if legacy:
+                recent = legacy
+        logger.info(f"记忆重建完成: 台账角色{len(merged['characters'])}条, 梗概{len(full)}字, 近期{len(recent)}字")
+        return merged, recent
+
+    def _apply_ledger_fixes(self, merged: dict) -> dict:
+        """应用人工修正层（ledger_manual_fixes）：
+        - characters: {名字: {字段: 覆盖值}} 覆盖角色状态
+        - foreshadowing: {伏笔: {status: "已回收"}} 标记回收
+        每次 rebuild 后应用——人工修正永远胜过 AI 重建结果。
+        """
+        fixes = self.vs.load_extra_data("ledger_manual_fixes", {}) or {}
+        chars = fixes.get("characters") or {}
+        if isinstance(chars, dict) and chars:
+            by_name = {c.get("name"): c for c in merged["characters"] if isinstance(c, dict)}
+            for name, patch in chars.items():
+                if isinstance(patch, dict) and name in by_name:
+                    by_name[name] = {**by_name[name], **patch}
+            merged["characters"] = list(by_name.values())
+        fs = fixes.get("foreshadowing") or {}
+        if isinstance(fs, dict) and fs:
+            by_item = {f.get("item"): f for f in merged["foreshadowing"] if isinstance(f, dict)}
+            for item, patch in fs.items():
+                if isinstance(patch, dict) and item in by_item:
+                    by_item[item] = {**by_item[item], **patch}
+            merged["foreshadowing"] = list(by_item.values())
+        return merged
+
+    def apply_ledger_fix(self, fix_type: str, key: str, patch: dict) -> dict:
+        """写入人工修正层并立即应用（防 AI 重建覆盖人工修改）。
+
+        fix_type: "character"（key=角色名，patch 覆盖 status 等）| "foreshadowing"（key=伏笔，patch 如 {"status": "已回收"}）
+        返回应用后的合并态。
+        """
+        fixes = self.vs.load_extra_data("ledger_manual_fixes", {}) or {}
+        section = "characters" if fix_type == "character" else "foreshadowing"
+        fixes.setdefault(section, {})
+        fixes[section][key] = {**(fixes[section].get(key) or {}), **patch}
+        self.vs.save_extra_data("ledger_manual_fixes", fixes)
+        merged, _ = self.rebuild_memory_from_deltas()
+        logger.info(f"人工修正已应用: {fix_type}={key} {patch}")
+        return merged
+
+    def clear_memory(self, deep: bool = False) -> dict:
+        """清空记忆：
+        deep=False：只清展示层（合并态/当前摘要），保留按章快照 → 下次生成章节时自动重建；
+        deep=True：彻底清空（含按章快照 ledger_deltas/摘要快照/人工修正层），真正的"失忆"。
+        """
+        for k in ("state_ledger", "rolling_summary", "rolling_summary_full", "rolling_summary_recent"):
+            self.vs.delete_extra_field(k)
+        if deep:
+            for k in ("ledger_deltas", "rolling_summaries", "rolling_summaries_full",
+                      "ledger_manual_fixes", "ledger_stale", "ledger_stale_from"):
+                self.vs.delete_extra_field(k)
+        else:
+            self.vs.save_extra_data("ledger_stale", False)
+        logger.info(f"记忆已清空: deep={deep}")
+        return {"cleared": True, "deep": deep}
 
     def invalidate_memory_from(self, chapter_num: int):
         """第 chapter_num 章内容发生变动（重生成/手动编辑/导入）后的记忆失效处理：
@@ -2190,10 +2314,13 @@ class FullNovelWorkflow:
         """
         deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
         summaries = self.vs.load_extra_data("rolling_summaries", {}) or {}
+        summaries_full = self.vs.load_extra_data("rolling_summaries_full", {}) or {}
         deltas = {k: v for k, v in deltas.items() if int(k) < chapter_num}
         summaries = {k: v for k, v in summaries.items() if int(k) < chapter_num}
+        summaries_full = {k: v for k, v in summaries_full.items() if int(k) < chapter_num}
         self.vs.save_extra_data("ledger_deltas", deltas)
         self.vs.save_extra_data("rolling_summaries", summaries)
+        self.vs.save_extra_data("rolling_summaries_full", summaries_full)
         self.rebuild_memory_from_deltas(upto_chapter=chapter_num - 1)
 
         chapters = self.novel_info.get("chapters", {})
@@ -2233,8 +2360,7 @@ class FullNovelWorkflow:
             for n in targets:
                 self._report(f"正在重建第{n}章的台账与摘要（{targets.index(n) + 1}/{len(targets)}）…")
                 content = chapters[str(n)]["content"]
-                self.update_state_ledger(n, content, max_tokens=max_tokens)
-                self.update_rolling_summary(n, content)
+                self.update_memory(n, content, max_tokens=max_tokens)
         self.vs.save_extra_data("ledger_stale", False)
         merged, summary = self.rebuild_memory_from_deltas()
         return {"regenerated": len(targets), "ledger": merged, "summary": summary}
@@ -2251,83 +2377,122 @@ class FullNovelWorkflow:
             return content
         return content[:head] + "\n……（中间省略）……\n" + content[-tail:]
 
-    def update_state_ledger(self, chapter_num: int, content: str, max_tokens: int = 1500) -> dict:
-        """章节生成后 AI 增量更新状态台账（角色状态/时间线/伏笔），失败静默"""
-        old = self.vs.load_extra_data("state_ledger", {}) or {}
-        old_brief = json.dumps(old, ensure_ascii=False)[:2000] if old else "（空）"
+    def update_memory(self, chapter_num: int, content: str, max_tokens: int = 2500) -> dict:
+        """章节生成后**一次调用**更新全部记忆（原台账+摘要两次调用合并，每章省一次）。
 
-        prompt = f"""你是小说设定管理助手。请阅读最新一章正文，增量更新"状态台账"。
+        单 prompt 产出 delta + 全书梗概 + 近期摘要（B2/B6）：
+        - B3 结构化喂料：全部角色名 + 近 15 章活跃角色状态（消灭旧 2000 字截断盲区）
+        - B4 失败自动重试 1 次（带格式纠正），仍失败置 ledger_stale 并告警（不再静默）
+        返回 {"delta": ..., "full": ..., "recent": ..., "ok": bool}
+        """
+        ledger = self.vs.load_extra_data("state_ledger", {}) or {}
+        old_full = self.vs.load_extra_data("rolling_summary_full", "") or \
+            self.vs.load_extra_data("rolling_summary", "") or ""
+        old_recent = self.vs.load_extra_data("rolling_summary_recent", "") or ""
 
-【已有台账】
-{old_brief}
+        char_names = "、".join(
+            c.get("name", "") for c in ledger.get("characters", [])
+            if isinstance(c, dict) and c.get("name")) or "（暂无角色）"
+        active_lines = []
+        for c in ledger.get("characters", []):
+            if isinstance(c, dict) and c.get("name"):
+                upd = int(c.get("updated_chapter") or 0)
+                if upd >= chapter_num - 15:
+                    active_lines.append(f"- {c['name']}: {c.get('status', '')}")
+        old_brief = "\n".join(active_lines) or "（空）"
+        ledger_full_brief = json.dumps(ledger, ensure_ascii=False)[:1500]
 
-【第 {chapter_num} 章正文（头尾节选）】
-{self._chapter_excerpt(content)}
+        prompt = f"""你是小说设定管理助手。请阅读最新一章正文，一次性产出三个结果（只输出合法 JSON，不要输出其他内容）：
 
-请只输出合法 JSON（不要输出其他内容）：
 {{
-  "characters": [{{"name": "角色名", "status": "本章后的状态变化（位置/伤势/关系/实力等，无变化则不列出）"}}],
-  "timeline": [{{"chapter": {chapter_num}, "event": "本章核心事件一句话"}}],
-  "foreshadowing": [
-    {{"item": "伏笔内容", "planted_chapter": {chapter_num}, "target_chapter": null, "status": "未回收"}}
-  ]
+  "delta": {{
+    "characters": [{{"name": "角色名", "status": "本章后的状态变化（位置/伤势/关系/实力等，无变化则不列出）"}}],
+    "timeline": [{{"chapter": {chapter_num}, "event": "本章核心事件一句话"}}],
+    "foreshadowing": [
+      {{"item": "伏笔内容", "planted_chapter": {chapter_num}, "target_chapter": null, "status": "未回收"}}
+    ]
+  }},
+  "full_summary": "全书剧情梗概（≤300字）：从第1章到现在的整体主线，早期关键设定/主角目标必须长期保留，不随章节增多而丢失",
+  "recent_summary": "近期剧情摘要（≤500字）：最近约10章（第 {max(1, chapter_num - 10)} 章至今）的详细剧情，保留事件细节与状态变化"
 }}
 
-注意：
-- 只报告本章**新增或发生变化**的条目，无变化就返回空数组
-- 伏笔：本章埋下的新伏笔标记"未回收"；本章回收了旧伏笔也要列出并标记"已回收"
-- 必须只输出 JSON"""
+【全部登场角色名单（角色状态如有变化必须列出；未提及的视为无变化）】
+{char_names}
 
-        try:
-            result = self.api.generate(prompt, step="consistency", temperature=0.2, max_tokens=max_tokens)
-            m = re.search(r"\{.*\}", result, re.DOTALL)
-            if not m:
-                return old
-            delta = json.loads(m.group(0))
-            # 按章存 delta（可追溯/可撤销），合并态由全部 delta 顺序重建
-            deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
-            deltas[str(chapter_num)] = delta
-            self.vs.save_extra_data("ledger_deltas", deltas)
-            merged, _ = self.rebuild_memory_from_deltas()
-            logger.info(f"状态台账已更新: 角色{len(merged['characters'])} 时间线{len(merged['timeline'])} 伏笔{len(merged['foreshadowing'])}")
-            return merged
-        except Exception as e:
-            logger.warning(f"状态台账更新失败（不影响主流程）: {e}")
-            return old
+【角色当前状态（近15章内活跃角色）】
+{old_brief}
 
-    def update_rolling_summary(self, chapter_num: int, content: str, max_tokens: int = 1000) -> str:
-        """章节生成后更新滚动全书摘要（压缩到约800字的长线记忆），失败静默"""
-        old_summary = self.vs.load_extra_data("rolling_summary", "") or ""
+【既有伏笔与时间线（参考）】
+{ledger_full_brief[:800]}
 
-        prompt = f"""你是小说剧情记录助手。请把最新一章的核心剧情并入"全书滚动摘要"。
+【已有全书梗概】
+{old_full or "（空）"}
 
-【已有摘要（截至第 {chapter_num - 1} 章）】
-{old_summary or "（空，这是第一章）"}
+【已有近期摘要】
+{old_recent or "（空）"}
 
 【第 {chapter_num} 章正文（头尾节选）】
 {self._chapter_excerpt(content)}
 
-要求：
-- 输出更新后的全书摘要，总长度控制在 800 字以内
-- 保留主线关键事件和状态变化，丢弃细节描写
-- 按章节顺序叙述，早期章节可逐渐压缩概括
-- 直接输出摘要文本，不要解释
+注意：
+- delta 只报告本章**新增或发生变化**的条目：角色无变化不要列出；伏笔本章新埋标记"未回收"，本章回收旧伏笔也要列出并标记"已回收"
+- full_summary 是全书级梗概：早期内容必须保留要点，不要因为后续章节多就把开头删掉
+- recent_summary 聚焦最近章节细节，与 full_summary 分工互补
+- 必须只输出 JSON"""
 
-更新后摘要："""
+        for attempt in range(2):
+            try:
+                result = self.api.generate(prompt, step="consistency", temperature=0.2, max_tokens=max_tokens)
+                if is_ai_refusal(result):
+                    break
+                m = re.search(r"\{.*\}", result, re.DOTALL)
+                if not m:
+                    raise ValueError("输出中未找到 JSON 对象")
+                data = json.loads(m.group(0))
+                delta = data.get("delta") or {}
+                if not isinstance(delta, dict):
+                    raise ValueError("delta 不是对象")
+                # 按章存 delta（可追溯/可撤销），合并态由全部 delta 顺序重建
+                deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
+                deltas[str(chapter_num)] = delta
+                self.vs.save_extra_data("ledger_deltas", deltas)
+                merged, _ = self.rebuild_memory_from_deltas()
+                # 双摘要分通道存储（含按章快照，供失效重建）
+                full = (data.get("full_summary") or "").strip()
+                recent = (data.get("recent_summary") or "").strip()
+                if full:
+                    snaps = self.vs.load_extra_data("rolling_summaries_full", {}) or {}
+                    snaps[str(chapter_num)] = full
+                    self.vs.save_extra_data("rolling_summaries_full", snaps)
+                    self.vs.save_extra_data("rolling_summary_full", full)
+                if recent:
+                    snaps = self.vs.load_extra_data("rolling_summaries", {}) or {}
+                    snaps[str(chapter_num)] = recent
+                    self.vs.save_extra_data("rolling_summaries", snaps)
+                    self.vs.save_extra_data("rolling_summary_recent", recent)
+                self.vs.save_extra_data("ledger_stale", False)
+                logger.info(f"记忆已更新: 角色{len(merged['characters'])} 伏笔{len(merged['foreshadowing'])} 梗概{len(full)}字 近期{len(recent)}字")
+                return {"delta": delta, "full": full, "recent": recent, "ok": True}
+            except Exception as e:
+                logger.warning(f"第{chapter_num}章记忆更新第 {attempt + 1} 次失败: {e}")
+                if attempt == 0:
+                    prompt += "\n\n【注意】你上次的输出解析失败（不是合法 JSON 或结构不对）。请严格按给定 JSON 结构输出，不要多解释。"
+        # 重试仍失败：标记 stale，交 UI 提示（不再静默吞掉）
+        self.vs.save_extra_data("ledger_stale", True)
+        if not self.vs.load_extra_data("ledger_stale_from", None):
+            self.vs.save_extra_data("ledger_stale_from", chapter_num)
+        logger.warning(f"第{chapter_num}章记忆更新失败，已标记待重建")
+        return {"delta": {}, "full": "", "recent": "", "ok": False}
 
-        try:
-            summary = self.api.generate(prompt, step="consistency", temperature=0.2, max_tokens=max_tokens)
-            if summary and not is_ai_refusal(summary):
-                # 存每章的累计快照（重建时取不超过 upto 的最新快照即可）
-                summaries = self.vs.load_extra_data("rolling_summaries", {}) or {}
-                summaries[str(chapter_num)] = summary
-                self.vs.save_extra_data("rolling_summaries", summaries)
-                self.vs.save_extra_data("rolling_summary", summary)
-                logger.info(f"滚动摘要已更新: {len(summary)}字")
-                return summary
-        except Exception as e:
-            logger.warning(f"滚动摘要更新失败（不影响主流程）: {e}")
-        return old_summary
+    def update_state_ledger(self, chapter_num: int, content: str, max_tokens: int = 1500) -> dict:
+        """兼容薄封装：仅更新台账部分（内部走 update_memory，保持旧返回类型）"""
+        r = self.update_memory(chapter_num, content, max_tokens=max_tokens)
+        return self.vs.load_extra_data("state_ledger", {}) or {}
+
+    def update_rolling_summary(self, chapter_num: int, content: str, max_tokens: int = 1000) -> str:
+        """兼容薄封装：仅更新摘要部分（内部走 update_memory，保持旧返回类型）"""
+        r = self.update_memory(chapter_num, content, max_tokens=max_tokens)
+        return r.get("recent") or ""
 
     def generate_chapter_beats(self, chapter_num: int, chapter_title: str, target_words: int = 2000, max_tokens: int = 2000) -> str:
         """生成章节细纲（场景卡）：3-6 个场景节拍，供用户编辑确认后按场景生成正文
@@ -2393,9 +2558,10 @@ class FullNovelWorkflow:
 
 场景细纲："""
         
-        beats = self.api.generate(prompt, step="outline", temperature=0.7, max_tokens=max_tokens)
+        beats = self.api.generate(prompt, step="outline", temperature=0.7, max_tokens=max_tokens,
+                              stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
         # 节拍自动校验：生成后程序化检查各场景是否点名尚未登场的角色（实体时间锁）
-        # 越界则带提示自动重生成，最多 2 次；仍越界则保留最近结果并记录告警
+        # 越界则带「逐场景定位反馈」自动重生成，最多 2 次；仍越界则保留最近结果并记录告警
         for attempt in range(3):
             if is_ai_refusal(beats):
                 break
@@ -2408,9 +2574,20 @@ class FullNovelWorkflow:
             logger.warning(f"第{chapter_num}章节拍校验未通过（第{attempt + 1}次）: {self.last_beats_warning}")
             if attempt >= 2:
                 break
+            # 逐场景定位反馈：列出越界场景原文 + 具体问题 + 本章允许的角色名单
+            fb_parts = []
+            for sc in check.get("scene_feedback", []):
+                probs = "；".join(sc.get("problems", []))
+                fb_parts.append(
+                    f"场景「{sc.get('head', '')}」原文：\n{sc.get('text', '')[:300]}\n"
+                    f"问题：{probs}")
+            allowed = f"本章允许出现的角色：{char_names or '（本章大纲中的人物）'}。"
             beats = self.api.generate(
-                prompt + f"\n\n【校验反馈】上次输出越界了：{'；'.join(check['issues'][:5])}。请把越界的场景改写为本章范围内的事件，重新输出完整场景卡。",
-                step="outline", temperature=0.7, max_tokens=max_tokens)
+                prompt + f"\n\n【校验反馈（逐场景定位）】上次输出的以下场景越界了：\n"
+                         + "\n\n".join(fb_parts[:5])
+                         + f"\n\n{allowed}请把越界场景改写为本章范围内的事件（不得点名未登场角色），重新输出完整场景卡。",
+                step="outline", temperature=0.7, max_tokens=max_tokens,
+                stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
         if not is_ai_refusal(beats):
             self.vs.save_extra_data(f"chapter_beats_{chapter_num}", beats)
         return beats
@@ -2418,18 +2595,24 @@ class FullNovelWorkflow:
     def validate_beats(self, beats_text: str, chapter_num: int) -> dict:
         """程序化校验节拍是否越界：解析各场景，检查是否点名尚未登场的角色/代号。
 
-        返回 {"ok": bool, "issues": [..]}——issues 为空即 ok。
-        这是「实体时间锁」在节拍侧的落地：模型输出再自律，
-        也比不上写完后逐场景对一遍注册表。
+        返回 {"ok": bool, "issues": [..], "scene_feedback": [{head, text, problems}]}
+        issues 为空即 ok。这是「实体时间锁」在节拍侧的落地：
+        纯程序字符串比对，**不需要任何 LLM 介入**——模型输出再自律，
+        也比不上写完后逐场景对一遍角色注册表。
         """
         issues = []
+        scene_feedback = []
         registry = self._build_entity_registry()
         for beat in self.parse_beats(beats_text or ""):
             head = beat.strip().split("\n", 1)[0].strip()[:24]
+            problems = []
             for name, appear in registry.items():
                 if appear > chapter_num and name in beat:
-                    issues.append(f"场景「{head}」出现未登场角色「{name}」（第{appear}章才登场）")
-        return {"ok": not issues, "issues": issues}
+                    problems.append(f"出现未登场角色「{name}」（第{appear}章才登场）")
+            if problems:
+                issues.append(f"场景「{head}」出现未登场角色" + "；".join(p for p in problems))
+                scene_feedback.append({"head": head, "text": beat.strip()[:300], "problems": problems})
+        return {"ok": not issues, "issues": issues, "scene_feedback": scene_feedback}
     
     def review_chapter(self, chapter_num: int, chapter_title: str, content: str, max_tokens: int = 2500) -> str:
         """AI 评审章节：多维度评分 + 问题清单 + 修改建议（商业化质量标准）"""
@@ -2446,6 +2629,10 @@ class FullNovelWorkflow:
                 spoiler_level="none", current_volume=cur_vol)
 
         world_brief = self.novel_info.get("world_setting", "")[:2000]
+
+        # B5：台账注入评审——角色状态/近期事件/待回收伏笔，让"设定一致性"维度能抓到
+        # 正文与角色当前状态的矛盾（如正文写主角还在县城、台账说他已在魔都）
+        ledger_brief = self._ledger_brief(chapter_num, pc)
 
         # 人物：优先只注入当前章在场角色卡（与生成一致），无卡片时回退全文摘要
         characters_brief = ""
@@ -2464,6 +2651,9 @@ class FullNovelWorkflow:
 
 【人物设定（摘要）】
 {characters_brief}
+
+【角色状态与剧情台账（一致性对照依据）】
+{ledger_brief or "（暂无台账）"}
 
 【本章大纲】
 {outline_for_chapter[:1500]}

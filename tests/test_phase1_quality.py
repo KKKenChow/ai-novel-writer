@@ -24,13 +24,10 @@ class FakeAPI:
         self.outputs = list(outputs)
         self.prompts = []
     def generate(self, prompt, step="", **kw):
-        # 台账/摘要等后台自动调用直接应答，不消耗预设输出队列
-        if "状态台账" in prompt:
+        # 记忆更新（台账+摘要合并调用）等后台自动调用直接应答，不消耗预设输出队列
+        if "full_summary" in prompt:
             self.prompts.append(prompt)
-            return "{}"
-        if "滚动摘要" in prompt:
-            self.prompts.append(prompt)
-            return "摘要。"
+            return '{"delta": {"characters": [], "timeline": [], "foreshadowing": []}, "full_summary": "摘要。", "recent_summary": "摘要。"}'
         self.prompts.append(prompt)
         return self.outputs.pop(0) if self.outputs else "默认正文。" * 300
 
@@ -77,7 +74,7 @@ def test_parse_beats_plain():
 
 def main_prompts(wf):
     """过滤掉台账/摘要等后台自动调用，只保留正文生成 prompt"""
-    return [p for p in wf.api.prompts if "状态台账" not in p and "滚动摘要" not in p]
+    return [p for p in wf.api.prompts if "full_summary" not in p]
 
 
 def test_generate_by_beats_calls_per_scene():

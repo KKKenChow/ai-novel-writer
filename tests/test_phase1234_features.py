@@ -37,16 +37,17 @@ class FakeAPI:
         self.prompts = []
     def generate(self, prompt, step="", **kw):
         self.prompts.append(prompt)
-        if "状态台账" in prompt:
-            # 按章回传不同的伏笔，模拟真实台账 delta
+        if "full_summary" in prompt:
+            # 记忆更新（台账+摘要合并调用）：按章回传不同的伏笔，模拟真实台账 delta
             import re as _re
             m = _re.search(r"第 (\d+) 章正文", prompt)
             n = m.group(1) if m else "0"
-            return json.dumps({"foreshadowing": [
-                {"item": f"伏笔{n}号", "planted_chapter": int(n), "status": "未回收"}]},
+            return json.dumps({
+                "delta": {"foreshadowing": [
+                    {"item": f"伏笔{n}号", "planted_chapter": int(n), "status": "未回收"}]},
+                "full_summary": "梗概。",
+                "recent_summary": f"截至当前的摘要（含第{len(self.prompts)}次调用）。"},
                 ensure_ascii=False)
-        if "滚动摘要" in prompt:
-            return f"截至当前的摘要（含第{len(self.prompts)}次调用）。"
         return self.outputs.pop(0) if self.outputs else "默认输出内容。" * 100
 
 
@@ -93,7 +94,7 @@ def test_rolling_summary_snapshot_rebuild():
     wf.update_rolling_summary(1, "第一章内容")
     wf.update_rolling_summary(2, "第二章内容")
     wf.invalidate_memory_from(2)
-    assert wf.vs.extra["rolling_summary"]  # 回滚到第 1 章快照，而非清空
+    assert wf.vs.extra["rolling_summary_recent"]  # 回滚到第 1 章快照，而非清空
 
 
 # ---------- 1.2 / 1.3 导入与空白章节 ----------

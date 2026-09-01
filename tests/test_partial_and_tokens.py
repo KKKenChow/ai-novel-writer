@@ -34,10 +34,8 @@ class FakeAPI:
         self.outputs = list(outputs)
         self.prompts = []
     def generate(self, prompt, step="", **kw):
-        if "状态台账" in prompt:
-            return "{}"
-        if "滚动摘要" in prompt:
-            return "摘要。"
+        if "full_summary" in prompt:
+            return '{"delta": {"characters": [], "timeline": [], "foreshadowing": []}, "full_summary": "摘要。", "recent_summary": "摘要。"}'
         self.prompts.append(prompt)
         out = self.outputs.pop(0) if self.outputs else "默认正文。" * 300
         if isinstance(out, Exception):
@@ -201,7 +199,7 @@ def test_beat_max_tokens_uses_override(tmp_config):
             super().__init__(outputs)
             self.mts = []
         def generate(self, prompt, step="", **kw):
-            if "状态台账" not in prompt and "滚动摘要" not in prompt:
+            if "full_summary" not in prompt:
                 self.mts.append(kw.get("max_tokens"))
             return super().generate(prompt, step=step, **kw)
 

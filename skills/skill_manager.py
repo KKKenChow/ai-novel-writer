@@ -209,49 +209,6 @@ def inject_skills(prompt: str, step: str, novel_states: Optional[Dict[str, bool]
     return f"{extra}\n\n{'=' * 20}\n\n{prompt}"
 
 
-# ---------------- 智能推荐（关键词重合度打分，无外部依赖） ----------------
-
-def sync_skills_index(db_path: str = ""):
-    """已废弃：JSON 存储方案下无需维护向量索引。保留空实现兼容旧调用。"""
-    return
-
-
-def _skill_text(s: Dict) -> str:
-    return f"{s['name']}\n{s['description']}\n{' '.join(s['keywords'])}\n{s['body'][:500]}"
-
-
-def _bigrams(text: str) -> set:
-    text = re.sub(r"\s+", "", text)
-    return {text[i:i + 2] for i in range(len(text) - 1)} if len(text) >= 2 else {text}
-
-
-def recommend_skills(query: str, step: Optional[str] = None,
-                     exclude_dirs: Optional[List[str]] = None,
-                     n_results: int = 3, db_path: str = "") -> List[Dict]:
-    """根据 query 与 skill 描述/关键词的重合度推荐 skill（按相关度排序）"""
-    exclude_dirs = set(exclude_dirs or [])
-    if not query or not query.strip():
-        return []
-    q = _bigrams(query[:1000])
-    scored = []
-    for s in list_skills():
-        if s["dir"] in exclude_dirs:
-            continue
-        if step and step not in s["apply_to"]:
-            continue
-        b = _bigrams(_skill_text(s))
-        if not b:
-            continue
-        score = len(q & b) / len(q | b)
-        if score > 0:
-            scored.append((score, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [
-        {"dir": s["dir"], "name": s["name"], "distance": 1 - score, "apply_to": s["apply_to"]}
-        for score, s in scored[:n_results]
-    ]
-
-
 # ---------------- 本地导入外部 skill ----------------
 
 def import_skill_from_zip(file_obj, original_name: str = "") -> str:

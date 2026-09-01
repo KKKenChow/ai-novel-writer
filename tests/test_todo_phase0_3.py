@@ -36,10 +36,8 @@ class FakeAPI:
         self.prompts = []
     def generate(self, prompt, step="", **kw):
         self.prompts.append(prompt)
-        if "状态台账" in prompt:
-            return "{}"
-        if "滚动摘要" in prompt:
-            return "摘要。"
+        if "full_summary" in prompt:
+            return '{"delta": {"characters": [], "timeline": [], "foreshadowing": []}, "full_summary": "摘要。", "recent_summary": "摘要。"}'
         return self.outputs.pop(0) if self.outputs else "默认输出内容。" * 100
 
 

@@ -87,10 +87,4 @@ def test_atomic_write_no_tmp_left(store, tmp_path):
     assert not leftovers
 
 
-def test_skill_recommend():
-    from skills import skill_manager
-    skills = skill_manager.list_skills()
-    if not skills:
-        pytest.skip("无内置 skill")
-    recs = skill_manager.recommend_skills("写一场热血的战斗场面", step="chapter")
-    assert isinstance(recs, list)
+

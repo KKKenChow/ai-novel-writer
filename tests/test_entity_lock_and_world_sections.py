@@ -264,9 +264,11 @@ def test_validate_beats_detects_not_appeared_entity():
     r = wf.validate_beats(beats, 5)
     assert r["ok"] is False
     assert any("叶凡" in i for i in r["issues"])
+    assert r["scene_feedback"][0]["head"]  # 逐场景定位反馈
+    assert any("叶凡" in p for p in r["scene_feedback"][0]["problems"])
     # 第10章（已登场）→ 通过
     r2 = wf.validate_beats(beats, 10)
-    assert r2["ok"] is True and r2["issues"] == []
+    assert r2["ok"] is True and r2["issues"] == [] and r2["scene_feedback"] == []
 
 
 def test_generate_chapter_beats_auto_regenerate_on_validation_fail():
@@ -279,3 +281,8 @@ def test_generate_chapter_beats_auto_regenerate_on_validation_fail():
     beats = wf.generate_chapter_beats(5, "入门")
     assert "山门初探" in beats            # 采用校验通过的第2次输出
     assert wf.last_beats_warning == ""
+    # 第2次重试 prompt 带逐场景定位反馈（场景原文+问题+允许角色名单）
+    retry_p = wf.api.prompts[1]
+    assert "校验反馈（逐场景定位）" in retry_p
+    assert "小凡" in retry_p             # 越界场景原文
+    assert "第10章才登场" in retry_p     # 具体问题定位
