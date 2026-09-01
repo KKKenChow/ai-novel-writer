@@ -58,6 +58,7 @@ const STEP_NAMES = {
   consistency: "一致性检查", relation_graph: "角色图谱", distill: "技能蒸馏",
   extend_outline: "扩展大纲", volume_chapters: "逐章概要", rewrite_outline: "局部改写大纲",
   migrate_cards: "迁移角色卡", memory_rebuild: "重建台账", rewrite_preview: "改写建议预览",
+  validate_beats: "校验节拍",
 };
 
 function runGeneration(step, params, { onToken, onDone, onError, streamTarget } = {}) {
@@ -713,6 +714,7 @@ function tabWorld(root) {
       type: "setting", sectionTitle: "world_setting",
       originalKey: "world_setting_original", promptKey: "world_setting_prompt",
     }));
+    root.insertAdjacentHTML("beforeend", `<div class="caption">💡 世界观按 #/## 小节自动分档注入正文：开篇/早期只给「时代/地理/规则」等稳定背景，中期加「势力格局」，后期才全量。想控制每档内容，请用小节标题标注（如「## 4. 势力格局」「## 5. 情感脉络」）。</div>`);
   }
 }
 
@@ -757,7 +759,8 @@ async function renderCharacterCards(root) {
     <div class="caption">点击角色块查看/编辑详情。各环节读取规则：<br>
       · 大纲：注入全部角色卡（不设上限）<br>
       · 卷逐章概要：按本卷章节区间过滤，只注入本卷登场角色<br>
-      · 章节正文 / 章节评审：按登场/退场章过滤，只注入本章在场角色</div>`;
+      · 章节正文 / 章节评审：按登场/退场章过滤，只注入本章在场角色；开篇/早期只给精简卡（名字/身份/性格）<br>
+      · 「别名/代号」字段（如 林晚→夜莺）：用于实体时间锁——未登场角色的名字/代号在正文上下文中会被自动遮蔽，登场后才恢复，防止提前剧透</div>`;
 
   if (mode !== "structured") {
     // 旧版自由文本小说：一次性的迁移入口（card-only 模式下不提供自由文本编辑）
@@ -838,7 +841,9 @@ async function renderCharacterCards(root) {
       <option value="support" ${c.role !== "main" ? "selected" : ""}>配角</option>`;
     roleSel.onchange = () => { c.role = roleSel.value; renderGrid(); renderDetail(i); };
     const r1 = el("div", "row");
-    r1.append(fieldRow("姓名", nameI), fieldRow("类型", roleSel));
+    const aliasI = el("input"); aliasI.type = "text"; aliasI.value = c.alias || ""; aliasI.placeholder = "如：夜莺（实体时间锁用）";
+    aliasI.oninput = () => { c.alias = aliasI.value; };
+    r1.append(fieldRow("姓名", nameI), fieldRow("别名/代号", aliasI), fieldRow("类型", roleSel));
     detail.append(r1);
 
     const idI = el("input"); idI.type = "text"; idI.value = c.identity || ""; idI.placeholder = "如：青云宗外门弟子";
@@ -1038,6 +1043,33 @@ function renderOutlineExtra(root) {
     runGeneration("rewrite_outline", { start, end, instruction }, { onDone: () => refreshNovel(true) });
   };
   box.append(rwWrap);
+
+  // TODO 3.2b：逐章概要独立编辑（数据仍存于大纲「## 逐章概要」之后，卷级部分不动）
+  if (S.novel.outline) {
+    const sumWrap = el("div");
+    sumWrap.innerHTML = `<label class="field" style="margin-top:10px">📝 编辑逐章概要</label>
+      <div class="caption">独立编辑大纲中的逐章概要段（「## 逐章概要」之后全部内容），卷级大纲不受影响；保存后与「小说大纲」编辑区同步。逐章概要生成时会按角色卡标注的登场章安排角色出场。</div>`;
+    const sumTa = el("textarea"); sumTa.rows = 10;
+    sumTa.style.width = "100%";
+    const sumStatus = el("div", "caption", "加载中…");
+    sumWrap.append(sumTa, sumStatus);
+    let sumTimer = null;
+    sumTa.oninput = () => {
+      clearTimeout(sumTimer);
+      sumTimer = setTimeout(async () => {
+        try {
+          const r = await api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter_summaries`, { method: "PUT", body: { content: sumTa.value } });
+          S.novel.outline = r.outline || S.novel.outline;
+          sumStatus.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+        } catch (e) { sumStatus.textContent = `保存失败：${e.message}`; }
+      }, 800);
+    };
+    api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter_summaries`)
+      .then((r) => { sumTa.value = r.summaries || ""; sumStatus.textContent = "编辑后自动保存"; })
+      .catch((e) => { sumStatus.textContent = `加载失败：${e.message}`; });
+    box.append(sumWrap);
+  }
+
   root.append(box);
 }
 
@@ -1307,7 +1339,7 @@ function renderChapterGenerator(root, bare = false) {
   // 场景节拍
   const beatsBox = el("div");
   beatsBox.innerHTML = `<label class="field">场景节拍（可选，提供时按场景逐段生成，质量更稳）</label>
-    <div class="caption">未保存时自动预填大纲逐章概要；保存后独立存储，大纲更新时会提示可重新预填。</div>`;
+    <div class="caption">未保存时自动预填大纲逐章概要；保存后独立存储，大纲更新时会提示可重新预填。生成时系统会自动校验节拍是否点名了尚未登场的角色（实体时间锁），越界会自动重生成；也可用「🔍 校验节拍」按钮手动复查。</div>`;
   const beatsTa = el("textarea"); beatsTa.rows = 5;
   beatsTa.placeholder = "可留空；点击「生成场景节拍」让 AI 规划 3-6 个场景";
   // 大纲概要更新提示条（默认隐藏）
@@ -1346,7 +1378,20 @@ function renderChapterGenerator(root, bare = false) {
     beatsNotice.classList.add("hidden");
     alertMsg("success", "场景节拍已保存");
   };
-  beatsOps.append(beatsBtn, beatsSave);
+  // 节拍校验（实体时间锁）：检查各场景是否点名了尚未登场的角色/代号
+  const beatsCheck = el("button", "btn small shrink", "🔍 校验节拍");
+  beatsCheck.onclick = () => {
+    const num = +box.querySelector("#ch-num").value;
+    const text = beatsTa.value.trim();
+    if (!text) { alertMsg("warn", "请先生成或填写节拍内容"); return; }
+    runGeneration("validate_beats", { chapter_num: num, beats: text }, {
+      onDone: (r) => {
+        if (r.ok) alertMsg("success", "✅ 节拍校验通过：所有场景均未点名未登场角色");
+        else alertMsg("error", `节拍越界：\n${(r.issues || []).slice(0, 5).join("\n")}`, 12000);
+      },
+    });
+  };
+  beatsOps.append(beatsBtn, beatsCheck, beatsSave);
   beatsBox.append(beatsTa, beatsNotice, beatsOps);
   box.append(beatsBox);
   // 加载节拍：已保存 > 未保存草稿 > 大纲逐章概要预填

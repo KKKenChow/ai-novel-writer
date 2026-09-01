@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # 角色卡字段定义：(字段key, 中文标签, 是否必填)
 CARD_FIELDS = [
     ("name", "姓名", True),
+    ("alias", "别名/代号", False),   # 代号/外号/马甲（如「夜莺」），用于实体时间锁遮蔽
     ("role", "类型", False),           # 主角/配角 → main/support
     ("identity", "身份", False),
     ("personality", "性格", False),
@@ -40,6 +41,7 @@ CARD_FIELDS = [
 # LLM 输出格式说明（嵌入生成 prompt）
 TAGGED_FORMAT = """[角色]
 姓名：角色姓名
+别名/代号：外号/代号/马甲（如「夜莺」；没有就留空）
 类型：主角 或 配角
 身份：身份背景一句话
 性格：性格特点
@@ -56,7 +58,7 @@ CARDS_SECTION_TITLE = "cards"
 def new_card(name: str, role: str = "support") -> Dict:
     """创建一张空白角色卡"""
     return {
-        "name": name, "role": role, "identity": "", "personality": "",
+        "name": name, "alias": "", "role": role, "identity": "", "personality": "",
         "relationships": "", "appearance_chapter": 1, "exit_chapter": None,
         "notes": "",
     }
@@ -109,6 +111,8 @@ def cards_to_text(cards: List[Dict]) -> str:
     for c in cards:
         role_label = "主角" if c.get("role") == "main" else "配角"
         lines = [f"■ {c['name']}（{role_label}）"]
+        if c.get("alias"):
+            lines.append(f"别名/代号：{c['alias']}")
         if c.get("identity"):
             lines.append(f"身份：{c['identity']}")
         if c.get("personality"):
@@ -120,6 +124,26 @@ def cards_to_text(cards: List[Dict]) -> str:
         lines.append(span)
         if c.get("notes"):
             lines.append(f"备注：{c['notes']}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def cards_to_brief(cards: List[Dict]) -> str:
+    """角色卡精简渲染（开篇/早期阶段注入用）：只含名字/别名/身份/性格。
+
+    不含人物关系、登场行、备注——这些字段往往带着人物弧线/后续剧情，
+    开篇阶段不该让模型看到（信息按叙事时点解锁）。
+    """
+    parts = []
+    for c in cards:
+        role_label = "主角" if c.get("role") == "main" else "配角"
+        lines = [f"■ {c['name']}（{role_label}）"]
+        if c.get("alias"):
+            lines.append(f"别名/代号：{c['alias']}")
+        if c.get("identity"):
+            lines.append(f"身份：{c['identity']}")
+        if c.get("personality"):
+            lines.append(f"性格：{c['personality']}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
 

@@ -52,6 +52,8 @@ class FullNovelWorkflow:
         self.novel_info = {}
         # 最近一次章节生成的范围校验警告（供 UI 展示）
         self.last_scope_warning = ""
+        # 最近一次节拍校验警告（供 UI 展示；空串表示校验通过）
+        self.last_beats_warning = ""
         # 可选回调（供 Web 界面使用）：阶段进度 fn(str)、正文流式输出 fn(str)
         self.on_progress = None
         self.on_token = None
@@ -108,6 +110,8 @@ class FullNovelWorkflow:
         # 保存到本地存储
         self.vs.add_section("setting", "world_setting", result)
         self.novel_info["world_setting"] = result
+        # 按 #/## 小节拆分存档，供正文注入按需取档（稳定/势力/剧情分档，避免整本走向前移）
+        self._save_world_sections()
         return result
     
     def generate_characters(self, user_prompt: str, num_main: int = 3, num_support: int = 5, max_tokens: int = 2000) -> Dict:
@@ -218,6 +222,129 @@ class FullNovelWorkflow:
         if cards:
             self.novel_info["character_cards"] = cards
         return cards
+
+    # ---------- 实体注册表 / 实体时间锁（信息按叙事时点解锁） ----------
+
+    def _build_entity_registry(self) -> Dict[str, int]:
+        """构建实体注册表：{名字/别名/代号: 登场章节}
+
+        用于实体时间锁：注入上下文前，把尚未登场角色的名字/代号遮蔽掉，
+        防止世界观/检索片段/自由文本里提前点名后续才该登场的角色（防信息前移）。
+        角色卡是唯一带登场章信息的来源；自由文本人物无登场信息，不参与遮蔽。
+        """
+        registry = {}
+        for c in self.load_character_cards():
+            appear = int(c.get("appearance_chapter") or 1)
+            name = str(c.get("name", "")).strip()
+            if name and len(name) >= 2:
+                registry[name] = appear
+                # 兼容旧模板：姓名里直接带代号（如「林晚（代号"夜莺"）」），把代号也注册
+                m = re.search(r'[（(]\s*(?:代号|外号|别名)[：:"“”]*([^）)」』]+)', name)
+                if m:
+                    code = m.group(1).strip().strip('"”\'’')
+                    if len(code) >= 2:
+                        registry[code] = appear
+            alias = str(c.get("alias", "") or "").strip()
+            if alias:
+                for a in re.split(r"[、,，/／\s]+", alias):
+                    if len(a.strip()) >= 2:
+                        registry[a.strip()] = appear
+        return registry
+
+    def _lock_entities(self, text: str, chapter_num: int) -> str:
+        """实体时间锁：把文本中尚未登场角色的名字/代号替换为「某个神秘角色」。
+
+        只替换登场章晚于当前章的实体；已登场/无登场信息的实体原样保留。
+        """
+        if not text:
+            return text
+        locked_names = []
+        for name, appear in self._build_entity_registry().items():
+            if appear > chapter_num and name in text:
+                text = text.replace(name, "某个神秘角色")
+                locked_names.append(f"{name}(第{appear}章登场)")
+        if locked_names:
+            logger.info(f"实体时间锁[{chapter_num}章]: 遮蔽未登场实体 {locked_names}")
+        return text
+
+    # ---------- 世界观按需注入（稳定/势力/结局 三档，随阶段解锁） ----------
+
+    _WORLD_STABLE_KEYWORDS = ("时代", "背景", "地理", "构架", "规则", "体系", "文明", "历史", "文化", "社会", "经济", "职业", "世界", "设定", "环境")
+    _WORLD_FACTION_KEYWORDS = ("势力", "组织", "格局", "阵营", "门派", "宗门", "家族", "帝国", "联盟", "势力格局")
+    _WORLD_STYLE_KEYWORDS = ("视角", "风格", "情感", "脉络", "亮点", "总结", "结局", "走向", "主线", "暂定名")
+
+    @staticmethod
+    def _classify_world_header(header: str) -> str:
+        """按小节标题分类世界观段落：stable（稳定背景）/ faction（势力格局）/ style（剧情走向）"""
+        h = header.strip().lstrip("#").strip()
+        if any(k in h for k in FullNovelWorkflow._WORLD_FACTION_KEYWORDS):
+            return "faction"
+        if any(k in h for k in FullNovelWorkflow._WORLD_STYLE_KEYWORDS):
+            return "style"
+        return "stable"
+
+    def _split_world_sections(self, text: str) -> List[Dict]:
+        """把世界观文本按 #/## 小节拆分，返回 [{title, content, kind}]。
+
+        无小节标题的文本整体视为一个 stable 段（保证任何世界观都能注入）。
+        """
+        if not text:
+            return []
+        lines = text.split("\n")
+        sections = []
+        cur_title, cur_lines, cur_kind = None, [], "stable"
+        def flush():
+            nonlocal cur_title, cur_lines
+            if cur_lines:
+                sections.append({"title": cur_title or "", "content": "\n".join(cur_lines).strip(),
+                                 "kind": cur_kind})
+        for line in lines:
+            m = re.match(r"^(#{1,4})\s*(.+)$", line.strip())
+            if m and len(line.strip()) <= 60:
+                flush()
+                cur_title = line.strip()
+                cur_kind = self._classify_world_header(line)
+                cur_lines = []
+            else:
+                cur_lines.append(line)
+        flush()
+        if not sections and text.strip():
+            sections.append({"title": "", "content": text.strip(), "kind": "stable"})
+        return sections
+
+    def _save_world_sections(self):
+        """生成/保存世界观后，把小节拆分结果存 extra（供注入时按需取档）"""
+        text = self.novel_info.get("world_setting", "") or ""
+        sections = self._split_world_sections(text)
+        if sections:
+            self.vs.save_extra_data("world_sections", sections)
+
+    def _stable_world_text(self, level: str = "stable", chapter_num: int = 0,
+                           max_chars: int = 4000) -> str:
+        """按档取世界观注入文本：
+        - stable：只保留稳定背景段（时代/地理/规则）
+        - faction：稳定背景 + 势力格局段
+        - full：全部
+        返回前应用实体时间锁（防世界观点名未登场角色）。
+        """
+        text = self.novel_info.get("world_setting", "") or \
+            self.vs.get_section("setting", "world_setting") or ""
+        if not text:
+            return ""
+        sections = self.vs.load_extra_data("world_sections", None) or self._split_world_sections(text)
+        allowed = {"stable", "faction"} if level == "faction" else {"stable"}
+        if level == "full":
+            parts = [s["content"] for s in sections]
+        else:
+            parts = [s["content"] for s in sections if s["kind"] in allowed]
+        result = "\n\n".join(parts).strip()
+        if not result:
+            result = text[:max_chars]
+        if chapter_num > 0:
+            result = self._lock_entities(result, chapter_num)
+        if len(result) > max_chars:
+            result = result[:max_chars] + "..."
+        return result
 
     def _character_section(self, limit: int = 4000, start_ch: Optional[int] = None,
                            end_ch: Optional[int] = None) -> str:
@@ -418,7 +545,8 @@ class FullNovelWorkflow:
 
         # 只生成第一卷的逐章概要；卷间盲写问题由 generate_volume_chapters 解决
         # （后续卷生成时注入前一卷逐章概要 + 滚动摘要）
-        vol_result = self._generate_single_volume_chapters(volumes[0], stage1_result, max_tokens)
+        vol_result = self._generate_single_volume_chapters(
+            volumes[0], stage1_result, max_tokens, words_per_chapter=words_per_chapter)
         if vol_result:
             all_parts.append(f"### {volumes[0]['name']}\n{vol_result}\n\n")
             volume_plan[0]["chapters_done"] = True
@@ -430,21 +558,37 @@ class FullNovelWorkflow:
         return final_result
 
     def _generate_single_volume_chapters(self, vol: dict, stage1_result: str, max_tokens: int,
-                                         prev_volume_detail: str = "") -> Optional[str]:
+                                         prev_volume_detail: str = "",
+                                         words_per_chapter: int = 0) -> Optional[str]:
         """为单卷生成逐章概要（两阶段第二阶段 + 惰性补全共用）。
 
         prev_volume_detail: 前一卷的逐章概要（惰性补全时注入，解决卷间盲写：
         写第 N 卷细纲时能看到第 N-1 卷的章节拆分和章末钩子，节奏/伏笔才能衔接）。
+        words_per_chapter: 每章基准目标字数（0 时调用方需自行解析；prompt 中作为「约N字」的浮动基准，
+        避免 AI 凭感觉乱填与全局设定严重脱节的字数）。
         失败重试 1 次；返回 None 表示彻底失败（调用方记录缺失，不影响其他卷）。
         生成后自动校验全局章号，模型从 1 重排时自动偏移改写。
         """
+        if not words_per_chapter or words_per_chapter <= 0:
+            words_per_chapter = self._resolve_global_words_per_chapter()
         vol_name = vol["name"]
         start_ch, end_ch = vol["start_chapter"], vol["end_chapter"]
         vol_chapters = end_ch - start_ch + 1
-        # 本卷登场角色：直接从角色卡按卷区间过滤注入（无卡时回退自由文本）
-        characters_brief = self._character_section(limit=2500, start_ch=start_ch, end_ch=end_ch)
+        # 本卷登场角色：直接从角色卡按卷区间过滤注入（无卡时回退自由文本）。
+        # 登场章列表前置（「名字（第X章登场）」，限长截断也不丢登场信息）+ 完整角色卡详情供参考
+        characters_brief = ""
+        cards = self.load_character_cards()
+        if cards:
+            vol_cards = cc.filter_cards_for_range(cards, start_ch, end_ch)
+            if vol_cards:
+                appear_list = "\n".join(
+                    f"- {c.get('name', '')}（第{c.get('appearance_chapter', 1)}章登场）" for c in vol_cards)
+                detail = cc.cards_to_text(vol_cards)[:2500]
+                characters_brief = f"【本卷登场角色及登场章】\n{appear_list}\n\n【角色详情】\n{detail}"
+        if not characters_brief:
+            characters_brief = self._character_section(limit=2500, start_ch=start_ch, end_ch=end_ch)
         characters_block = f"""
-【人物设定（本卷登场角色）】
+【人物设定（本卷登场角色及登场章）】
 {characters_brief}
 """ if characters_brief else ""
         # max_tokens 按卷章数线性放大（每章约 80 tokens），上限取 API 允许值
@@ -471,10 +615,11 @@ class FullNovelWorkflow:
 
 格式要求：
 第 X 章：章节标题 —— 一句话概括（约N字）
-（N 为本章目标字数，按剧情节奏在常规每章字数基础上浮动：铺垫章可略短，高潮章可略长）
+（N 为本章目标字数，围绕每章基准 {words_per_chapter} 字按剧情节奏浮动：铺垫章可略短（不少于基准的一半），高潮章可略长）
 
 【重要】
 - 章节编号是全书全局编号：必须从第 {start_ch} 章开始，连续编号到第 {end_ch} 章，不得从 1 重新编号
+- **角色登场章对齐**：上面「人物设定」里每个角色都标注了「第X章登场」，该角色必须在其标注的登场章**首次出场**（登场章之前的章节概要中不得安排其出场）；如你的剧情安排与标注冲突，请以标注的登场章为准调整概要，不要提前安排出场
 - 你必须写完这 {vol_chapters} 章的全部内容，不能中途停止或省略。"""
 
         vol_result = None
@@ -506,6 +651,44 @@ class FullNovelWorkflow:
         idx_old = outline.find(VOLUME_CHAPTER_MARKER_OLD)
         candidates = [i for i in (idx_new, idx_old) if i >= 0]
         return min(candidates) if candidates else -1
+
+    def get_chapter_summaries(self) -> str:
+        """取大纲中的逐章概要段（「## 逐章概要」标记**之后**的文本）；无标记返回空串。
+
+        供前端「编辑逐章概要」独立编辑——数据仍存于大纲 section 内，卷级部分不受影响。
+        """
+        outline = self.novel_info.get("outline", "") or \
+            self.vs.get_section("outline", "full_outline") or ""
+        idx = self._find_volume_chapter_marker(outline)
+        if idx < 0:
+            return ""
+        # 跳过标记行本身（可能是旧标记「## 逐章大纲」）
+        line_end = outline.find("\n", idx)
+        return outline[line_end + 1:].rstrip() if line_end >= 0 else ""
+
+    def update_chapter_summaries(self, content: str) -> str:
+        """整体替换大纲中的逐章概要段（卷级部分逐字保留），返回更新后的大纲全文。
+
+        大纲尚无逐章概要标记时，在末尾追加标记与内容。
+        """
+        outline = self.novel_info.get("outline", "") or \
+            self.vs.get_section("outline", "full_outline") or ""
+        idx = self._find_volume_chapter_marker(outline)
+        content = content.strip()
+        # 防御：内容里误带标记行/多余分隔线时剥掉
+        for marker in (VOLUME_CHAPTER_MARKER, VOLUME_CHAPTER_MARKER_OLD):
+            if content.startswith(marker):
+                content = content[len(marker):].lstrip("\n")
+        base = outline[:idx].rstrip() if idx >= 0 else outline.rstrip()
+        base = re.sub(r"(?:\n---)+\s*$", "", base)  # 去掉已有分隔线（含历史叠加），统一由本函数补
+        if idx >= 0:
+            new_outline = base + f"\n\n---\n\n{VOLUME_CHAPTER_MARKER}\n{content}\n"
+        else:
+            new_outline = base + f"\n\n---\n\n{VOLUME_CHAPTER_MARKER}\n{content}\n"
+        self.vs.add_section("outline", "full_outline", new_outline)
+        self.novel_info["outline"] = new_outline
+        logger.info(f"逐章概要已更新: {len(content)}字，卷级部分保留 {len(base)}字")
+        return new_outline
 
     def generate_volume_chapters(self, volume_index: int, max_tokens: int = 4000, force: bool = False) -> Optional[str]:
         """惰性生成/重新生成指定卷的逐章概要（TODO 3.2.0）。
@@ -546,7 +729,8 @@ class FullNovelWorkflow:
         vol_result = self._generate_single_volume_chapters(
             {"name": vol["name"], "plot": vol.get("plot", ""),
              "start_chapter": vol["start"], "end_chapter": vol["end"]},
-            stage1_result, max_tokens, prev_detail)
+            stage1_result, max_tokens, prev_detail,
+            words_per_chapter=self._resolve_global_words_per_chapter())
         if vol_result is None:
             return None
 
@@ -658,6 +842,16 @@ class FullNovelWorkflow:
         old_excerpt = self._extract_relevant_outline(outline, (start + end) // 2,
                                                      capture_range=(end - start) // 2 + 1,
                                                      spoiler_level="none")
+        # 改写范围内的登场角色：注入「名字（第X章登场）」+ 详情，保证角色设定与角色卡一致
+        cards = self.load_character_cards()
+        char_block = ""
+        if cards:
+            range_cards = cc.filter_cards_for_range(cards, start, end)
+            if range_cards:
+                appear_list = "\n".join(
+                    f"- {c.get('name', '')}（第{c.get('appearance_chapter', 1)}章登场）" for c in range_cards)
+                detail = cc.cards_to_text(range_cards)[:2500]
+                char_block = f"\n【该范围登场角色（必须与其设定一致）】\n{appear_list}\n\n【角色详情】\n{detail}\n"
         prompt = f"""请局部改写小说大纲中第 {start}-{end} 章的条目。
 
 【改写要求】
@@ -665,16 +859,19 @@ class FullNovelWorkflow:
 
 【这部分章节的现有大纲】
 {old_excerpt or "（大纲中未找到该范围条目，请直接创作）"}
-
+{char_block}
 【输出要求】
-- 只输出改写后的第 {start}-{end} 章条目，每章一行
-- 格式：第 X 章：章节标题 —— 一句话概括（约N字），N 为本章目标字数
+- 只输出改写后的第 {start}-{end} 章条目，每章一行，行与行之间不要空行
+- 格式严格为：第 X 章：章节标题 —— 一句话概括（约N字），N 为本章目标字数
+- **不要使用加粗（**）、列表符号（- ）、标题符号（###）等任何装饰，直接输出纯文本条目**
 - 编号从第 {start} 章连续到第 {end} 章
-- 只改这些章，前后章节的安排视为已定，需与之衔接"""
+- 只改这些章，前后章节的安排视为已定，需与之衔接
+- **角色一致性**：上面【该范围登场角色】标注了登场章与设定，条目中涉及的角色必须与其身份/性格/登场章一致，不得编造与角色卡冲突的身份；改写范围覆盖某角色登场章时，该角色须在对应章节首次出场"""
 
         result = self.api.generate(prompt, step="outline", temperature=0.7, max_tokens=max_tokens)
         if is_ai_refusal(result):
             return outline
+        result = self._normalize_chapter_lines(result)
         result = self._renumber_volume_outline(result, start, end)
 
         # 移除大纲中该范围的旧章节行，记录首个移除位置作为插入点
@@ -741,6 +938,35 @@ class FullNovelWorkflow:
 3. 若本章其实无需改动，直接说明"无需改动"及理由"""
         result = self.api.generate(prompt, step="consistency", temperature=0.5, max_tokens=max_tokens)
         return "" if is_ai_refusal(result) else result
+
+    @staticmethod
+    def _normalize_chapter_lines(text: str) -> str:
+        """归一化逐章条目格式：剥离加粗/列表/标题等装饰，合并空行与换行续行，
+        保证每章一条「第 X 章：标题 —— 概要（约N字）」纯文本行。
+
+        非章节行（AI 多输出的引言/卷标题）若前面已有章节行则并作续行，否则丢弃。
+        """
+        if not text:
+            return text
+        out = []
+        for l in text.split("\n"):
+            l = l.strip()
+            if not l:
+                continue
+            # 剥离装饰：### / - / * / ** 等
+            cleaned = re.sub(r"^#{1,6}\s*", "", l)
+            cleaned = re.sub(r"^[-\*]\s+", "", cleaned)
+            cleaned = re.sub(r"^\*{1,3}", "", cleaned)
+            cleaned = cleaned.replace("**", "").strip()
+            if not cleaned:
+                continue
+            if re.match(r"第\s*\d+\s*章", cleaned):
+                out.append(cleaned)
+            else:
+                # 非章节行：并到上一行末尾（续行），无上一行则丢弃（引言/卷标题）
+                if out:
+                    out[-1] += cleaned
+        return "\n".join(out)
 
     def _renumber_volume_outline(self, vol_result: str, start_ch: int, end_ch: int) -> str:
         """校验并修正单卷逐章概要的章节号：
@@ -1228,11 +1454,16 @@ class FullNovelWorkflow:
         outline_text = self.novel_info.get("outline", "")
         
         if setting_text:
-            # 世界观设定截断，最多 4000 字
+            # 世界观按档注入（信息按叙事时点解锁）：开篇/早期只给稳定背景，
+            # 中期加势力格局，后期全量；注入前套实体时间锁遮蔽未登场角色名
             SETTING_MAX = 4000
-            trunc = setting_text[:SETTING_MAX] + ("..." if len(setting_text) > SETTING_MAX else "")
-            context_parts.append(f"【世界观设定】\n{trunc}")
-            logger.info(f"世界观设定: 原始{len(setting_text)}字 → 传入{len(trunc)}字 (上限{SETTING_MAX})")
+            world_level = {"strict": "stable", "moderate": "stable",
+                           "minimal": "faction"}.get(phase_config.get("spoiler_level", "minimal"), "full")
+            world_text = self._stable_world_text(level=world_level, chapter_num=chapter_num,
+                                                 max_chars=SETTING_MAX)
+            if world_text:
+                context_parts.append(f"【世界观设定】\n{world_text}")
+                logger.info(f"世界观设定[{world_level}]: 原始{len(setting_text)}字 → 注入{len(world_text)}字 (上限{SETTING_MAX})")
         else:
             logger.info("世界观设定: 无")
             
@@ -1243,25 +1474,36 @@ class FullNovelWorkflow:
             # 未登场角色只注入名字列表作兜底，防止前文提及的角色显得凭空出现
             active, absent = cc.filter_cards_for_chapter(cards, chapter_num)
             if active:
-                cards_text = cc.cards_to_text(active)
+                # 开篇/早期（strict/moderate）：只注入精简卡（名字/身份/性格），
+                # 不带人物关系/备注弧线，防止把后续剧情写进当前章
+                if spoiler_level in ("strict", "moderate"):
+                    cards_text = cc.cards_to_brief(active)
+                else:
+                    cards_text = cc.cards_to_text(active)
                 CHAR_MAX = 6000
                 trunc = cards_text[:CHAR_MAX] + ("..." if len(cards_text) > CHAR_MAX else "")
                 if spoiler_level != "none":
                     trunc = self._strip_spoiler_sentences(trunc, level=spoiler_level)
                 context_parts.append(f"【人物设定】\n{trunc}")
-                logger.info(f"角色卡注入: {len(active)}/{len(cards)} 张在场角色卡")
+                logger.info(f"角色卡注入: {len(active)}/{len(cards)} 张在场角色卡 (模式={'brief' if spoiler_level in ('strict', 'moderate') else 'full'})")
             if absent:
                 context_parts.append(f"【尚未登场角色（仅名字，本章不得安排其出场或揭示其信息）】\n{'、'.join(absent)}")
             character_text = cc.cards_to_text(active)
         elif character_text:
-            # 人物设定截断，最多 6000 字
+            # 人物设定截断，最多 6000 字；开篇/早期只取精简字段行的免费文本受限——
+            # 自由文本无结构化字段，退而求其次：strict/moderate 阶段截断前 800 字并套实体锁
             CHAR_MAX = 6000
-            trunc = character_text[:CHAR_MAX] + ("..." if len(character_text) > CHAR_MAX else "")
+            if spoiler_level in ("strict", "moderate"):
+                trunc = character_text[:800]
+            else:
+                trunc = character_text[:CHAR_MAX]
             # 渐进式前瞻信息过滤：根据阶段决定过滤力度
             if spoiler_level != "none":
                 trunc = self._strip_spoiler_sentences(trunc, level=spoiler_level)
                 logger.info(f"人物设定[{spoiler_level}]: 已过滤前瞻信息")
-            context_parts.append(f"【人物设定】\n{trunc}")
+            trunc = self._lock_entities(trunc, chapter_num)
+            if trunc:
+                context_parts.append(f"【人物设定】\n{trunc}")
             logger.info(f"人物设定: 原始{len(character_text)}字 → 传入{len(trunc)}字 (上限{CHAR_MAX})")
         else:
             logger.info("人物设定: 无")
@@ -1326,6 +1568,8 @@ class FullNovelWorkflow:
                 if lines and re.match(r"第\d+章", lines[0].strip()):
                     content = lines[1] if len(lines) > 1 else content
                 content = content[:800] + ("..." if len(content) > 800 else "")
+            # 实体时间锁：检索片段里若点名尚未登场的角色，一律遮蔽
+            content = self._lock_entities(content, chapter_num)
             extra_context.append(content[:1000])
         
         if extra_context:
@@ -1414,6 +1658,16 @@ class FullNovelWorkflow:
             # 字数未显式指定 → 从大纲带过来（逐章字数 → 全局每章字数 → 默认）
             target_words = self.resolve_target_words(chapter_num)
             logger.info(f"第{chapter_num}章字数未指定，从大纲解析为 {target_words} 字")
+
+        # 记忆自动闭环：前面的章被改动导致后续章台账/摘要 stale 时，自动补齐
+        # （否则本章生成时前情回顾/台账注入的是残缺记忆，会破坏一致性）
+        if self.vs.load_extra_data("ledger_stale", False):
+            logger.info("检测到台账 stale，生成前自动重建记忆")
+            self._report("正在自动重建台账与摘要（章节变动导致记忆过期）…")
+            try:
+                self.rebuild_memory(regen=True)
+            except Exception as e:
+                logger.warning(f"自动记忆重建失败（不影响本章生成）: {e}")
         
         # max_tokens 必须覆盖目标字数（中文1字≈1.5-2 token），否则首轮必截断
         needed_mt = min(int(target_words * 1.8), self.api.MAX_TOKENS_LIMIT)
@@ -2076,34 +2330,56 @@ class FullNovelWorkflow:
         return old_summary
 
     def generate_chapter_beats(self, chapter_num: int, chapter_title: str, target_words: int = 2000, max_tokens: int = 2000) -> str:
-        """生成章节细纲（场景卡）：3-6 个场景节拍，供用户编辑确认后按场景生成正文"""
-        # 前置保障：确保本章所属卷已有逐章概要，否则 _build_chapter_context 提取不到章节标记，
-        # 会兜底返回整本书卷级概览，导致第一章节拍就涵盖多章内容。
+        """生成章节细纲（场景卡）：3-6 个场景节拍，供用户编辑确认后按场景生成正文
+
+        节拍只锚定本章：**不注入**全书走向/世界观/人物弧线/台账（它们描述的是整个故事设计，
+        写第一章不该带进后续章节内容），只给本章那一行逐章概要 + 本章登场角色名 + 阶段叙事指令。
+        """
+        # 前置保障：确保本章所属卷已有逐章概要，否则提取不到章节标记会兜底返回整本书卷级概览
         self.ensure_outline_for_chapter(chapter_num)
         if not target_words or target_words <= 0:
             target_words = self.resolve_target_words(chapter_num)
         # 标题为空时从大纲补齐，确保场景节拍对齐到具体章节
         if not chapter_title.strip():
             chapter_title = self.get_outline_chapter_titles().get(chapter_num, "")
-        ctx = self._build_chapter_context(chapter_num, chapter_title)
-        # 单独抽出本章那一行概要作为场景节拍的唯一大纲依据（capture_range=0 只取本章）
+        n_beats = min(6, max(3, target_words // 800))
+
+        # 本章那一行逐章概要（唯一大纲依据）：spoiler_level=strict 剔除顶部总述（含全部后续卷剧情），
+        # capture_range=0 只保留本章条目
         outline = self.novel_info.get("outline", "") or self.vs.get_section("outline", "full_outline") or ""
         chapter_anchor = self._extract_relevant_outline(
-            outline, chapter_num, capture_range=0, spoiler_level="none") if outline else ""
-        n_beats = min(6, max(3, target_words // 800))
-        
+            outline, chapter_num, capture_range=0, spoiler_level="strict") if outline else ""
+
+        # 本章登场角色：只注入名字（含主/配角标注），不注入身份/人物关系/备注弧线，防止把后续剧情带进来
+        char_names = ""
+        cards = self.load_character_cards()
+        if cards:
+            active, _absent = cc.filter_cards_for_chapter(cards, chapter_num)
+            if active:
+                parts = []
+                for c in active:
+                    role_label = "主角" if c.get("role") == "main" else "配角"
+                    parts.append(f"{c.get('name', '')}（{role_label}）")
+                char_names = "、".join(parts)
+
+        # 当前阶段叙事指令（开篇严禁抢跑等）
+        total_chapters = self._estimate_total_chapters()
+        phase_config = self._classify_chapter_phase(chapter_num, total_chapters)
+
         prompt = f"""你是一位专业的小说结构编辑。请为第 {chapter_num} 章 "{chapter_title}" 设计**场景细纲**（不是正文）。
 
-{ctx["context_text"]}
-{ctx["phase_config"]["pacing_instruction"]}
+【本章登场角色】
+{char_names or "（暂无）"}
 
 【本章大纲（唯一依据，场景节拍只围绕本章，不得覆盖后续章节）】
 {chapter_anchor or "（暂无本章大纲条目）"}
 
+{phase_config["pacing_instruction"]}
+
 【要求】
 - 把本章拆成 {n_beats} 个场景节拍，每个场景有可识别的地点/人物/冲突推进
 - 场景节拍内容**严格限定在第 {chapter_num} 章「{chapter_title}」概要描述的事件范围内**，只展开本章该发生的事
-- **严禁抢跑**：不要把后续章节才该出现的冲突、转折、角色提前放进本章节拍
+- **严禁抢跑**：不要把后续章节才该出现的冲突、转折、角色提前放进本章节拍。本章节拍只覆盖第 {chapter_num} 章本身，绝不能把第 {chapter_num + 1} 章及以后的内容写进来
 - 每个场景按以下格式输出（严格遵守，方便程序解析）：
 
 ## 场景1：场景名
@@ -2113,15 +2389,47 @@ class FullNovelWorkflow:
 - 结尾钩子/进展：...（这个场景结束时留下的悬念或状态变化）
 
 - 场景之间要有递进，最后一个场景的钩子要让人想点开下一章
-- {ctx["anti_rush"]}
 - 直接输出场景卡，不要解释
 
 场景细纲："""
         
         beats = self.api.generate(prompt, step="outline", temperature=0.7, max_tokens=max_tokens)
+        # 节拍自动校验：生成后程序化检查各场景是否点名尚未登场的角色（实体时间锁）
+        # 越界则带提示自动重生成，最多 2 次；仍越界则保留最近结果并记录告警
+        for attempt in range(3):
+            if is_ai_refusal(beats):
+                break
+            check = self.validate_beats(beats, chapter_num)
+            if check["ok"]:
+                self.last_beats_warning = ""
+                self.vs.save_extra_data(f"chapter_beats_{chapter_num}", beats)
+                return beats
+            self.last_beats_warning = f"节拍校验未通过：{'；'.join(check['issues'][:3])}"
+            logger.warning(f"第{chapter_num}章节拍校验未通过（第{attempt + 1}次）: {self.last_beats_warning}")
+            if attempt >= 2:
+                break
+            beats = self.api.generate(
+                prompt + f"\n\n【校验反馈】上次输出越界了：{'；'.join(check['issues'][:5])}。请把越界的场景改写为本章范围内的事件，重新输出完整场景卡。",
+                step="outline", temperature=0.7, max_tokens=max_tokens)
         if not is_ai_refusal(beats):
             self.vs.save_extra_data(f"chapter_beats_{chapter_num}", beats)
         return beats
+
+    def validate_beats(self, beats_text: str, chapter_num: int) -> dict:
+        """程序化校验节拍是否越界：解析各场景，检查是否点名尚未登场的角色/代号。
+
+        返回 {"ok": bool, "issues": [..]}——issues 为空即 ok。
+        这是「实体时间锁」在节拍侧的落地：模型输出再自律，
+        也比不上写完后逐场景对一遍注册表。
+        """
+        issues = []
+        registry = self._build_entity_registry()
+        for beat in self.parse_beats(beats_text or ""):
+            head = beat.strip().split("\n", 1)[0].strip()[:24]
+            for name, appear in registry.items():
+                if appear > chapter_num and name in beat:
+                    issues.append(f"场景「{head}」出现未登场角色「{name}」（第{appear}章才登场）")
+        return {"ok": not issues, "issues": issues}
     
     def review_chapter(self, chapter_num: int, chapter_title: str, content: str, max_tokens: int = 2500) -> str:
         """AI 评审章节：多维度评分 + 问题清单 + 修改建议（商业化质量标准）"""
@@ -2280,11 +2588,8 @@ class FullNovelWorkflow:
         logger.info(f"get_outline_chapter_words: 从大纲解析出 {len(words)} 个章节字数")
         return words
 
-    def resolve_target_words(self, chapter_num: int, fallback: int = 2000) -> int:
-        """章节目标字数解析链：大纲逐章字数 → 大纲全局每章字数 → fallback"""
-        w = self.get_outline_chapter_words().get(chapter_num)
-        if w:
-            return w
+    def _resolve_global_words_per_chapter(self, fallback: int = 2000) -> int:
+        """解析全局每章基准字数（outline_words_per_chapter），失败回退 fallback"""
         try:
             saved = (self.novel_info.get("outline_words_per_chapter")
                      or self.vs.load_extra_data("outline_words_per_chapter", "") or "")
@@ -2293,6 +2598,13 @@ class FullNovelWorkflow:
         except (ValueError, TypeError):
             pass
         return fallback
+
+    def resolve_target_words(self, chapter_num: int, fallback: int = 2000) -> int:
+        """章节目标字数解析链：大纲逐章字数 → 大纲全局每章字数 → fallback"""
+        w = self.get_outline_chapter_words().get(chapter_num)
+        if w:
+            return w
+        return self._resolve_global_words_per_chapter(fallback)
 
     def generate_chapter_title(self, chapter_num: int, max_tokens: int = 100) -> str:
         """章节标题缺失时由 AI 根据大纲与剧情摘要拟定标题（小 token 调用）"""

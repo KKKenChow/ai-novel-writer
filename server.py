@@ -279,6 +279,17 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             if is_ai_refusal(beats):
                 raise ValueError("AI拒绝了本次细纲生成请求，请修改内容后重试")
             result_payload["beats"] = beats
+            warning = getattr(workflow, "last_beats_warning", "")
+            if warning:
+                result_payload["warning"] = warning
+
+        elif step == "validate_beats":
+            # 节拍程序化校验（实体时间锁）：检查各场景是否点名尚未登场的角色
+            chapter_num = int(params.get("chapter_num", 1))
+            beats_text = params.get("beats", "")
+            check = workflow.validate_beats(beats_text, chapter_num)
+            result_payload["ok"] = check["ok"]
+            result_payload["issues"] = check["issues"]
 
         elif step == "golden_chapter":
             chapter_num = int(params.get("chapter_num", 1))
@@ -871,6 +882,27 @@ def put_section(novel_id: str, sec: SectionIn):
 def delete_section(novel_id: str, type: str, title: str):
     get_store(novel_id).delete_section(type, title)
     return {"ok": True}
+
+
+class ChapterSummariesIn(BaseModel):
+    content: str = ""
+
+
+@app.get("/api/novels/{novel_id}/chapter_summaries")
+def get_chapter_summaries(novel_id: str):
+    """取大纲中的逐章概要段（「## 逐章概要」标记之后），供独立编辑"""
+    wf = get_store_workflow(novel_id)
+    return {"summaries": wf.get_chapter_summaries()}
+
+
+@app.put("/api/novels/{novel_id}/chapter_summaries")
+def put_chapter_summaries(novel_id: str, body: ChapterSummariesIn):
+    """整体替换逐章概要段（卷级大纲逐字保留），数据仍存于大纲 section 内"""
+    wf = get_store_workflow(novel_id)
+    if not (body.content or "").strip():
+        raise HTTPException(400, "逐章概要内容不能为空")
+    new_outline = wf.update_chapter_summaries(body.content)
+    return {"ok": True, "outline": new_outline}
 
 
 @app.put("/api/novels/{novel_id}/extra/{key}")
