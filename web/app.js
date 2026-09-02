@@ -292,6 +292,7 @@ function showTaskConfirm(taskId, msg, options) {
 
 // ---------- 数据加载 ----------
 async function refreshNovel(keepTab = false) {
+  await flushPendingSaves();
   if (!S.novelId) { S.novel = null; S.memoryStatus = null; renderAll(); return; }
   try {
     S.novel = await api(`/api/novels/${encodeURIComponent(S.novelId)}`);
@@ -664,6 +665,7 @@ function requireNovel() {
 function extra(key, dflt = "") { return (S.novel?.extra || {})[key] ?? dflt; }
 
 function saveSection(type, title, content) {
+  syncNovelSection(type, title, content);
   return api(`/api/novels/${encodeURIComponent(S.novelId)}/section`, { method: "PUT", body: { type, title, content } });
 }
 function delSection(type, title) {
@@ -674,6 +676,33 @@ function saveExtra(key, value) {
 }
 function delExtra(key) {
   return api(`/api/novels/${encodeURIComponent(S.novelId)}/extra/${encodeURIComponent(key)}`, { method: "DELETE" });
+}
+
+/* 保存后同步内存缓存：避免切 tab 重渲染（纯读 S.novel）读到旧数据。
+   在 PUT 发出前同步更新（乐观），保证 flush 后立即重渲染也是新内容。 */
+function syncNovelSection(type, title, content) {
+  if (!S.novel) return;
+  if (type === "setting" && title === "world_setting") {
+    S.novel.world_setting = content;
+  } else if (type === "character") {
+    S.novel.characters = content;
+  } else if (type === "outline" && title === "full_outline") {
+    S.novel.outline = content;
+  } else if (type === "chapter") {
+    const m = title.match(/^chapter_(\d+)$/);
+    if (m && S.novel.chapters?.[m[1]]) {
+      S.novel.chapters[m[1]].content = content.replace(/^第\d+章[^\n]*\n?/, "");
+    }
+  }
+}
+
+/* 待保存防抖 flush 注册表（textarea → flush 函数）：
+   重渲染/重新拉取前先把未落盘的编辑写出去，避免防抖窗口内重渲染丢弃输入。 */
+const pendingSaves = new Map();
+async function flushPendingSaves() {
+  const flushes = [...pendingSaves.values()];
+  pendingSaves.clear();
+  await Promise.allSettled(flushes.map((f) => f() || Promise.resolve()));
 }
 
 /* 通用生成块：prompt 输入 + 按钮 + 参数 */
@@ -717,12 +746,26 @@ function editableContent({ title, content, type, sectionTitle, originalKey, prom
   const status = el("div", "caption", "编辑后自动保存");
   let timer = null;
   const saver = onSave || ((v) => saveSection(type, sectionTitle, v));
+  const saveNow = async () => {
+    await saver(ta.value);
+    status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+  };
+  // 重渲染前 flush：取消防抖立即落盘（saveSection 已同步内存，重渲染读到的是新内容）
+  const flush = () => {
+    if (!timer) return null;
+    clearTimeout(timer);
+    timer = null;
+    pendingSaves.delete(ta);
+    return saveNow().catch((e) => { status.textContent = `保存失败：${e.message}`; });
+  };
   ta.oninput = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
-      await saver(ta.value);
-      status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+      timer = null;
+      pendingSaves.delete(ta);
+      try { await saveNow(); } catch (e) { status.textContent = `保存失败：${e.message}`; }
     }, 800);
+    pendingSaves.set(ta, flush);
   };
   const ops = el("div", "row");
   const clearBtn = el("button", "btn small shrink", "🗑️ 清除");
@@ -1125,15 +1168,28 @@ function renderOutlineExtra(root) {
     const sumStatus = el("div", "caption", "加载中…");
     sumWrap.append(sumHint, sumTa, sumStatus);
     let sumTimer = null;
+    const saveSum = async () => {
+      const r = await api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter_summaries`, { method: "PUT", body: { content: sumTa.value } });
+      S.novel.outline = r.outline || S.novel.outline;
+      sumStatus.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+    };
+    // 重渲染前 flush：乐观合并进 S.novel.outline，保证重渲染（大纲主编辑区）读到新概要
+    const sumFlush = () => {
+      if (!sumTimer) return null;
+      clearTimeout(sumTimer);
+      sumTimer = null;
+      pendingSaves.delete(sumTa);
+      S.novel.outline = mergeOutlineSummary(splitOutlineSummary(S.novel.outline || "").base, sumTa.value);
+      return saveSum().catch((e) => { sumStatus.textContent = `保存失败：${e.message}`; });
+    };
     sumTa.oninput = () => {
       clearTimeout(sumTimer);
       sumTimer = setTimeout(async () => {
-        try {
-          const r = await api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter_summaries`, { method: "PUT", body: { content: sumTa.value } });
-          S.novel.outline = r.outline || S.novel.outline;
-          sumStatus.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
-        } catch (e) { sumStatus.textContent = `保存失败：${e.message}`; }
+        sumTimer = null;
+        pendingSaves.delete(sumTa);
+        try { await saveSum(); } catch (e) { sumStatus.textContent = `保存失败：${e.message}`; }
       }, 800);
+      pendingSaves.set(sumTa, sumFlush);
     };
     api(`/api/novels/${encodeURIComponent(S.novelId)}/chapter_summaries`)
       .then((r) => { sumTa.value = r.summaries || ""; sumStatus.textContent = "编辑后自动保存"; })
@@ -1823,12 +1879,26 @@ function renderChapterEditor(root) {
   const ta = el("textarea"); ta.rows = 20; ta.value = c.content;
   const status = el("div", "caption", "编辑后自动保存");
   let timer = null;
+  const saveNow = async () => {
+    await saveSection("chapter", `chapter_${key}`, `第${key}章 ${c.title}\n${ta.value}`);
+    status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+  };
+  // 重渲染前 flush：取消防抖立即落盘（saveSection 已同步内存，重渲染读到的是新内容）
+  const flush = () => {
+    if (!timer) return null;
+    clearTimeout(timer);
+    timer = null;
+    pendingSaves.delete(ta);
+    return saveNow().catch((e) => { status.textContent = `保存失败：${e.message}`; });
+  };
   ta.oninput = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
-      await saveSection("chapter", `chapter_${key}`, `第${key}章 ${c.title}\n${ta.value}`);
-      status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+      timer = null;
+      pendingSaves.delete(ta);
+      try { await saveNow(); } catch (e) { status.textContent = `保存失败：${e.message}`; }
     }, 800);
+    pendingSaves.set(ta, flush);
   };
   const ops = el("div", "row");
   const reviewBtn = el("button", "btn small shrink", "📝 AI 评审");
@@ -2184,9 +2254,9 @@ function tabFindReplace(root) {
     try {
       const { results } = await api(`/api/novels/${encodeURIComponent(S.novelId)}/find`, { method: "POST", body: { find_text: q } });
       if (results.length) {
-        const total = results.reduce((a, r) => a + (parseInt((r.split("：找到 ")[1] || "0").split(" 处")[0]) || 0), 0);
+        const total = results.reduce((a, r) => a + (parseInt((r.match(/找到 (\d+) 处/) || [])[1] || "0") || 0), 0);
         preview.innerHTML = `<div class="msg success">✅ 找到 ${total} 处匹配：</div>` +
-          results.map(r => `<div class="caption">• ${esc(r)}</div>`).join("");
+          results.map(r => `<div class="caption" style="margin:5px 0">• ${esc(r)}</div>`).join("");
       } else {
         preview.innerHTML = `<div class="msg info">未找到「${esc(q)}」</div>`;
       }
@@ -2566,6 +2636,7 @@ async function toggleSkill(dir, enabled) {
 
 // ---------- 渲染入口 ----------
 function renderTabContent() {
+  flushPendingSaves();
   const root = $("#tab-content");
   root.innerHTML = "";
   if (!requireNovel()) return;

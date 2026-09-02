@@ -3582,8 +3582,27 @@ class FullNovelWorkflow:
             self.vs.update_section("setting", "world_setting", gc["world_setting"])
             self.novel_info["world_setting"] = gc["world_setting"]
         
-        # 人物设定
-        if gc.get("characters") and find_text in gc["characters"]:
+        # 人物设定：优先替换角色卡（结构化模式，替换后双写 JSON+自由文本）；
+        # 自由文本模式直接替换整段
+        cards = gc.get("character_cards")
+        if cards:
+            changed = False
+            for c in cards:
+                name_before = str(c.get("name") or "?")
+                hits = []
+                for key, label in cc.CARD_SEARCH_FIELDS:
+                    text = str(c.get(key) or "")
+                    n = text.count(find_text)
+                    if n:
+                        c[key] = text.replace(find_text, replace_text)
+                        hits.append(f"{label} ×{n}")
+                if hits:
+                    changed = True
+                    total = sum(int(s.split("×")[1]) for s in hits)
+                    changes.append(f"👤 角色卡「{name_before}」：替换了 {total} 处（{'、'.join(hits)}）")
+            if changed:
+                self.save_character_cards(cards)
+        elif gc.get("characters") and find_text in gc["characters"]:
             count = gc["characters"].count(find_text)
             gc["characters"] = gc["characters"].replace(find_text, replace_text)
             changes.append(f"👤 人物设定：替换了 {count} 处")
@@ -3626,17 +3645,41 @@ class FullNovelWorkflow:
         return {"changes": changes, "updated_gc": gc}
     
     def global_find(self, find_text: str, gc: dict) -> list:
-        """全局查找：在所有内容中查找文本，返回匹配位置列表"""
+        """全局查找：在所有内容中查找文本，返回匹配位置列表
+        （人物设定命中时显示具体角色名与字段位置）"""
         results = []
-        
+
         if gc.get("world_setting") and find_text in gc["world_setting"]:
             count = gc["world_setting"].count(find_text)
             results.append(f"🌍 世界观设定：找到 {count} 处")
-        
-        if gc.get("characters") and find_text in gc["characters"]:
-            count = gc["characters"].count(find_text)
-            results.append(f"👤 人物设定：找到 {count} 处")
-        
+
+        # 人物设定：优先按角色卡逐字段定位（结构化模式）；自由文本模式按角色段落/行号定位
+        cards = gc.get("character_cards")
+        if cards:
+            for c in cards:
+                hits = [(label, str(c.get(key) or "").count(find_text))
+                        for key, label in cc.CARD_SEARCH_FIELDS]
+                hits = [(l, n) for l, n in hits if n]
+                if hits:
+                    total = sum(n for _, n in hits)
+                    detail = "、".join(f"{l} ×{n}" for l, n in hits)
+                    results.append(f"👤 角色卡「{c.get('name', '?')}」：找到 {total} 处（{detail}）")
+        elif gc.get("characters") and find_text in gc["characters"]:
+            text = gc["characters"]
+            if "■" in text:
+                # 以「■ 角色名」行切分角色段落（cards_to_text 渲染格式）
+                for seg in re.split(r"(?m)^(?=■\s)", text):
+                    n = seg.count(find_text)
+                    if n:
+                        header = seg.split("\n", 1)[0].strip()[:24] if seg.strip() else "（无标题段落）"
+                        results.append(f"👤 人物设定「{header}」：找到 {n} 处")
+            else:
+                # 无「■」分段的旧文本：按行号定位
+                for i, line in enumerate(text.split("\n"), 1):
+                    n = line.count(find_text)
+                    if n:
+                        results.append(f"👤 人物设定（第 {i} 行）：找到 {n} 处")
+
         if gc.get("outline") and find_text in gc["outline"]:
             count = gc["outline"].count(find_text)
             results.append(f"📋 小说大纲：找到 {count} 处")

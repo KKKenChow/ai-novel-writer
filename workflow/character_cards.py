@@ -54,6 +54,16 @@ TAGGED_FORMAT = """[角色]
 # 存储用的 section title（doc_id = "character_cards_cards"）
 CARDS_SECTION_TITLE = "cards"
 
+# 参与全文查找/替换的文本字段（排除角色类型、登场/退场章节等结构化字段）
+CARD_SEARCH_FIELDS = [
+    ("name", "姓名"),
+    ("alias", "别名/代号"),
+    ("identity", "身份"),
+    ("personality", "性格"),
+    ("relationships", "人物关系"),
+    ("notes", "备注"),
+]
+
 
 def new_card(name: str, role: str = "support") -> Dict:
     """创建一张空白角色卡"""
