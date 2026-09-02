@@ -1767,6 +1767,21 @@ class FullNovelWorkflow:
         if pacing_instruction:
             logger.info(f"[{phase_config['phase']}] 已注入阶段专属叙事指导")
         
+        # 断点兜底：当前无节拍但存在有进度的断点 → 采用断点的节拍走按场景路径，
+        # 保证「点击生成本章时会询问是否从断点续写」的提示与实际行为一致；
+        # 空进度断点（0 场景）无保留价值，直接清理避免残留提示
+        partial = self.vs.load_extra_data(f"chapter_partial_{chapter_num}")
+        if not (beats and beats.strip()):
+            if partial and partial.get("parts"):
+                saved_beats = (partial.get("beats_text") or "").strip()
+                if saved_beats:
+                    beats = saved_beats
+                    self._report(f"检测到第{chapter_num}章有未完成进度，已自动载入对应场景节拍")
+                else:
+                    self.vs.save_extra_data(f"chapter_partial_{chapter_num}", None)
+            elif partial:
+                self.vs.save_extra_data(f"chapter_partial_{chapter_num}", None)
+
         # ---- 有细纲时：按场景卡逐段生成 ----
         if beats and beats.strip():
             # 断点决策（续写/暂停/重来）在 _generate_chapter_by_beats 内部完成，
@@ -1956,6 +1971,11 @@ class FullNovelWorkflow:
         # 每场景 max_tokens：用户可在「高级设置」用 chapter_scene 覆盖（推理模型思考也占额度，默认可能不够）
         beat_max_tokens = self._step_max_tokens("chapter_scene") or \
             min(max(1500, int(words_per_beat * 2)), self.api.MAX_TOKENS_LIMIT)
+        # 推理模型且思考实际未关闭（含勾选关闭但接口忽略）：思考占输出额度，自动放大按场景预算
+        thinking_effectively_off = (getattr(self.api, "thinking_disabled", False)
+                                    and getattr(self.api, "thinking_disable_supported", True))
+        if getattr(self.api, "is_reasoning", False) and not thinking_effectively_off:
+            beat_max_tokens = min(int(beat_max_tokens * 3), self.api.MAX_TOKENS_LIMIT)
         logger.info(f"按细纲生成：{len(beats)} 个场景，每场景约 {words_per_beat} 字，beat_max_tokens={beat_max_tokens}")
 
         # ---- 断点检测：同章同细纲的未完成进度可续写 ----
@@ -2064,9 +2084,15 @@ class FullNovelWorkflow:
                         f"已完成的 {len(parts)} 个场景进度已保存。",
                         [{"action": "retry", "label": "重试本场景"},
                          {"action": "resume_later", "label": "稍后继续（保留进度）"},
-                         {"action": "cancel", "label": "取消（已生成场景存为草稿）"}])
+                         {"action": "cancel", "label": "取消（已生成场景存为草稿）"},
+                         {"action": "discard", "label": "🗑️ 丢弃全部已生成内容"}])
                     if action == "retry":
                         continue
+                    if action == "discard":
+                        # 清空断点与草稿，彻底放弃本章全部已生成内容
+                        self.vs.save_extra_data(partial_key, None)
+                        raise ChapterPaused(
+                            f"已放弃：第{chapter_num}章全部已生成内容已丢弃")
                     if action == "cancel" and parts:
                         # 已完成场景存为该章草稿正文，避免浪费已烧的 token
                         draft = "\n\n".join(parts)
@@ -2820,7 +2846,200 @@ class FullNovelWorkflow:
 改写后正文："""
         
         return self.api.generate(prompt, step="chapter", temperature=0.7, max_tokens=max_tokens, stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
-    
+
+    def _characters_brief(self, max_len: int = 2000) -> str:
+        """人物设定摘要：优先结构化角色卡，回退自由文本"""
+        cards = self.load_character_cards()
+        if cards:
+            return cc.cards_to_text(cards)[:max_len]
+        return self.novel_info.get("characters", "")[:max_len]
+
+    def review_content(self, content_type: str, content: str, chapter_num: int = None,
+                       chapter_title: str = "", max_tokens: int = 2500) -> str:
+        """AI 评审通用入口：outline / world_setting / characters / chapter（章节复用 review_chapter）"""
+        if content_type == "chapter":
+            if not chapter_num:
+                raise ValueError("评审章节需要指定章节号")
+            return self.review_chapter(chapter_num, chapter_title, content, max_tokens)
+        if content_type == "outline":
+            return self._review_outline(content, max_tokens)
+        if content_type == "world_setting":
+            return self._review_world_setting(content, max_tokens)
+        if content_type == "characters":
+            return self._review_characters(content, max_tokens)
+        raise ValueError(f"不支持的评审类型: {content_type}")
+
+    def _review_outline(self, outline: str, max_tokens: int = 3000) -> str:
+        """评审小说大纲：注入世界观/人物/已生成章节实际产出，检查结构与可行性"""
+        world_brief = self.novel_info.get("world_setting", "")[:2000]
+        characters_brief = self._characters_brief(2000)
+        chapters = self.novel_info.get("chapters", {})
+        written = sorted(int(k) for k in chapters if str(k).isdigit()
+                         and (chapters[k].get("content") or "").strip())
+        if written:
+            written_info = "、".join(f"第{k}章《{chapters[str(k)].get('title', '')}》" for k in written)
+        else:
+            written_info = "（尚未生成任何章节）"
+
+        prompt = f"""你是一位极其严格的网文/出版编辑。请评审这部小说的【大纲】质量。
+
+【世界观设定（摘要）】
+{world_brief or "（暂无世界观设定）"}
+
+【人物设定（摘要）】
+{characters_brief or "（暂无人物设定）"}
+
+【已生成章节实际产出】
+{written_info}
+
+【小说大纲】
+{outline}
+
+请按以下格式输出评审报告（严格遵守格式）：
+
+## 总分：X/10
+
+## 维度评分
+- 结构与主线推进：X/10 —— 一句话说明（主线是否清晰、卷布局与高潮节奏是否合理）
+- 逐章可行性：X/10 —— 一句话说明（每章目标字数与概要对齐、单章目标是否可执行）
+- 伏笔与回收安排：X/10 —— 一句话说明
+- 与已生成正文一致性：X/10 —— 一句话说明（大纲与实际写出来的章节是否偏离）
+- 文字表现力：X/10 —— 一句话说明（是否有 AI 腔/套话/流水账）
+
+## 问题清单
+1. （最严重的问题，引用原文句子）
+2. ...
+
+## 修改建议
+1. （每条建议要具体可执行，说明改哪里、怎么改）
+2. ...
+
+评审标准参考：商业化连载小说要求每章有明确目标与钩子、卷与卷之间有节奏起伏、伏笔埋设与回收闭环、大纲与实际正文不脱节。"""
+        return self.api.generate(prompt, step="consistency", temperature=0.3, max_tokens=max_tokens)
+
+    def _review_world_setting(self, world_setting: str, max_tokens: int = 3000) -> str:
+        """评审世界观设定：注入大纲/人物，检查自洽性与可展开性"""
+        outline_text = self.novel_info.get("outline", "") or ""
+        outline_brief = self._stage1_from_outline(outline_text)[:2000] if outline_text else "（暂无大纲）"
+        characters_brief = self._characters_brief(1500)
+
+        prompt = f"""你是一位极其严格的网文/出版编辑。请评审这部小说的【世界观设定】质量。
+
+【小说大纲（卷级部分摘要）】
+{outline_brief}
+
+【人物设定（摘要）】
+{characters_brief or "（暂无人物设定）"}
+
+【世界观设定】
+{world_setting}
+
+请按以下格式输出评审报告（严格遵守格式）：
+
+## 总分：X/10
+
+## 维度评分
+- 内部自洽性：X/10 —— 一句话说明（规则/力量体系/地理/时间线是否有矛盾）
+- 与大纲、人物的协调性：X/10 —— 一句话说明（是否支撑剧情展开、与人物设定冲突点）
+- 可展开性与留白：X/10 —— 一句话说明（有没有为后续剧情留出成长/冲突空间）
+- 细节密度与实用性：X/10 —— 一句话说明（细节是否服务于剧情而非堆砌）
+- 文字组织与表达：X/10 —— 一句话说明（是否有 AI 腔/套话/流水账）
+
+## 问题清单
+1. （最严重的问题，引用原文句子）
+2. ...
+
+## 修改建议
+1. （每条建议要具体可执行，说明改哪里、怎么改）
+2. ...
+
+评审标准参考：世界观应为剧情服务——规则清晰可自洽、设定有张力可展开、与大纲人物不冲突。"""
+        return self.api.generate(prompt, step="consistency", temperature=0.3, max_tokens=max_tokens)
+
+    def _review_characters(self, characters: str, max_tokens: int = 3000) -> str:
+        """评审人物设定：注入世界观/大纲/台账，检查弧光、动机与正文行为一致性"""
+        world_brief = self.novel_info.get("world_setting", "")[:1500]
+        outline_text = self.novel_info.get("outline", "") or ""
+        outline_brief = self._stage1_from_outline(outline_text)[:1500] if outline_text else "（暂无大纲）"
+        chapters = self.novel_info.get("chapters", {})
+        written = sorted(int(k) for k in chapters if str(k).isdigit()
+                         and (chapters[k].get("content") or "").strip())
+        ledger_brief = self._ledger_brief(written[-1] if written else 1)
+
+        prompt = f"""你是一位极其严格的网文/出版编辑。请评审这部小说的【人物设定】质量。
+
+【世界观设定（摘要）】
+{world_brief or "（暂无世界观设定）"}
+
+【小说大纲（卷级部分摘要）】
+{outline_brief}
+
+【角色状态与剧情台账（对照正文实际行为）】
+{ledger_brief or "（暂无台账）"}
+
+【已生成章节】
+{("、".join(f"第{k}章" for k in written)) if written else "（尚未生成任何章节）"}
+
+【人物设定】
+{characters}
+
+请按以下格式输出评审报告（严格遵守格式）：
+
+## 总分：X/10
+
+## 维度评分
+- 角色弧光与成长空间：X/10 —— 一句话说明（是否有清晰的成长线与转变空间）
+- 动机与行为一致性：X/10 —— 一句话说明（动机是否成立、行为是否可信）
+- 人物关系网络：X/10 —— 一句话说明（人物间关系是否有张力、是否会互相利用）
+- 与大纲、已生成正文的一致性：X/10 —— 一句话说明（设定与正文实际行为是否矛盾）
+- 文字组织与表达：X/10 —— 一句话说明（是否有 AI 腔/套话/流水账）
+
+## 问题清单
+1. （最严重的问题，引用原文句子）
+2. ...
+
+## 修改建议
+1. （每条建议要具体可执行，说明改哪里、怎么改）
+2. ...
+
+评审标准参考：商业化小说要求主角有明确目标与缺陷、动机驱动行为、人物间关系推动剧情而非摆设。"""
+        return self.api.generate(prompt, step="consistency", temperature=0.3, max_tokens=max_tokens)
+
+    def rewrite_by_review(self, content_type: str, content: str, review: str,
+                          chapter_num: int = None, chapter_title: str = "",
+                          max_tokens: int = 2000) -> str:
+        """按评审意见改写通用入口：章节复用 revise_chapter；其余类型按各自要求改写"""
+        if content_type == "chapter":
+            if not chapter_num:
+                raise ValueError("改写章节需要指定章节号")
+            return self.revise_chapter(chapter_num, chapter_title, content, review, max_tokens)
+        labels = {"outline": "小说大纲", "world_setting": "世界观设定", "characters": "人物设定"}
+        if content_type not in labels:
+            raise ValueError(f"不支持的改写类型: {content_type}")
+        label = labels[content_type]
+        # 输出长度需覆盖原文
+        needed = min(int(len(content) * 1.8) + 500, self.api.MAX_TOKENS_LIMIT)
+        max_tokens = max(max_tokens, needed)
+
+        prompt = f"""你是一位资深小说编辑。请根据评审意见改写{label}。
+
+【评审意见】
+{review}
+
+【原文】
+{content}
+
+【改写要求】
+- 逐条落实评审意见中的修改建议
+- 保留核心设定、主线与人物不变，只改进结构、表达与自洽性
+- 改写后总字数与原文相当（不少于原文的 85%）
+- 直接输出改写后的完整{label}，不要解释
+
+改写后内容："""
+
+        return self.api.generate(prompt, step="chapter", temperature=0.7, max_tokens=max_tokens,
+                                 stream_callback=self.on_token, reasoning_callback=self.on_reasoning)
+
     def generate_golden_chapter(self, chapter_num: int, chapter_title: str, max_tokens: int = 2500,
                                 target_words: int = 2000, beats: str = "") -> dict:
         """黄金开篇专项：生成两个版本 → 分别评审 → 选总分更高者。

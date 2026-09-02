@@ -13,8 +13,8 @@ const S = {
 
 const TABS = [
   ["🌍 世界观", "world"], ["👤 人物", "characters"], ["📋 大纲", "outline"],
-  ["📖 章节", "chapter"], ["✍️ 续写", "continue"], ["🎨 润色", "polish"],
-  ["🔍 一致性", "consistency"], ["🔎 查找替换", "findreplace"],
+  ["📖 章节", "chapter"], ["📝 AI 评审", "review"], ["✍️ 续写", "continue"],
+  ["🎨 润色", "polish"], ["🔎 查找替换", "findreplace"],
   ["🕸️ 角色图谱", "graph"], ["📤 导出", "export"], ["🧩 Skill管理", "skills"],
 ];
 
@@ -94,6 +94,7 @@ const STEP_NAMES = {
   world_setting: "世界观", characters: "人物设定", outline: "大纲",
   chapter: "章节", chapter_beats: "场景节拍", golden_chapter: "黄金开篇",
   continue: "续写", polish: "润色", chapter_review: "章节评审", chapter_revise: "章节改写",
+  content_review: "AI 评审", content_rewrite: "按评审改写",
   style_fingerprint: "文风指纹", humanize: "去AI腔", batch_chapters: "批量生成",
   consistency: "一致性检查", relation_graph: "角色图谱", distill: "技能蒸馏",
   extend_outline: "扩展大纲", volume_chapters: "逐章概要", rewrite_outline: "局部改写大纲",
@@ -691,7 +692,10 @@ function syncNovelSection(type, title, content) {
   } else if (type === "chapter") {
     const m = title.match(/^chapter_(\d+)$/);
     if (m && S.novel.chapters?.[m[1]]) {
-      S.novel.chapters[m[1]].content = content.replace(/^第\d+章[^\n]*\n?/, "");
+      const ch = S.novel.chapters[m[1]];
+      const m2 = content.match(/^第\d+章\s*(.*)$/);
+      if (m2) ch.title = m2[1].trim();
+      ch.content = content.replace(/^第\d+章[^\n]*\n?/, "");
     }
   }
 }
@@ -1201,7 +1205,9 @@ function renderOutlineExtra(root) {
 }
 
 // ---- 章节 Tab（最复杂） ----
-const chUI = { page: 0, pageSize: 10, deleteMode: false, toDelete: new Set(), activeKey: "", addMode: "generate" };
+const chUI = { page: 0, pageSize: 10, deleteMode: false, toDelete: new Set(), activeKey: "", addMode: "generate", adderOpen: undefined };
+// 编辑章节触发账本失效提示的节流（同章 60s 内只弹一次，避免防抖保存连续弹）
+const lastLedgerWarn = {};
 // 场景节拍未保存草稿（按章号暂存，重渲染后恢复）
 const beatsDrafts = {};
 
@@ -1211,14 +1217,15 @@ function tabChapter(root) {
   }
   renderChapterManager(root);
   renderChapterAdder(root);
-  renderMemoryPanel(root);
   renderChapterEditor(root);
   renderImpactScan(root);
 }
 
 /* 新增章节区：AI 生成 / 空白章节 / 导入章节 三种方式平级切换 */
 function renderChapterAdder(root) {
-  const box = collapsibleBox("➕ 新增章节");
+  // 默认展开；用户手动收起后状态持久化（chUI.adderOpen），切换模式重渲染不再折叠
+  const box = collapsibleBox("➕ 新增章节", { open: chUI.adderOpen !== false });
+  box.addEventListener("toggle", () => { chUI.adderOpen = box.open; });
   const tabsRow = el("div", "row");
   const modes = [["generate", "✍️ AI 生成"], ["blank", "➕ 空白章节"], ["import", "📥 导入章节"]];
   for (const [m, label] of modes) {
@@ -1651,13 +1658,17 @@ function renderChapterGenerator(root, bare = false) {
   root.append(box);
 }
 
-function renderMemoryPanel(root) {
+function renderMemorySidebar() {
+  const root = $("#memory-panel-body");
+  root.innerHTML = "";
+  if (!S.novel) {
+    root.innerHTML = `<div class="caption">请先在「小说管理」中创建或选择一本小说。</div>`;
+    return;
+  }
   const ledger = extra("state_ledger");
   const summaryFull = extra("rolling_summary_full") || extra("rolling_summary");
   const summaryRecent = extra("rolling_summary_recent");
   const ms = S.memoryStatus;
-  if (ms && !ms.has_ledger && !ms.has_summary) return;
-  if (!ms && !ledger && !summaryFull) return;
   const det = el("details", "box");
   det.open = true;
   det.innerHTML = `<summary><b>🧠 剧情账本（AI 自动记账）</b></summary>`;
@@ -1680,11 +1691,11 @@ function renderMemoryPanel(root) {
   if (ms && ms.manual_fixes) htext.push("含人工修改");
   health.textContent = htext.join(" · ") || "账本还是空的：生成章节后 AI 会自动开始记账";
   det.append(health);
-  // 过期提示（人话）
+  // 有正文但缺账页 → 无条件醒目提示（不再依赖 ledger_stale 标志）
   const missing = (ms && ms.missing_chapters) || [];
-  if (ms && ms.ledger_stale && missing.length) {
+  if (ms && missing.length) {
     const warn = el("div", "msg warn");
-    warn.textContent = `⚠️ 第 ${missing[0]}~${missing[missing.length - 1]} 章的账本已过期（这些章节被重写/编辑过，旧账不可信）。下次生成章节前会自动补齐，也可以点下面的「同步账本」立即补齐。`;
+    warn.textContent = `⚠️ 检测到第 ${missing[0]}~${missing[missing.length - 1]} 章有正文但账本为空/过期（章节被编辑或生成失败）。生成下一章前会自动补齐，也可以点下面的「同步账本」立即补齐（约 ${missing.length} 次调用）。`;
     det.append(warn);
   }
 
@@ -1876,12 +1887,28 @@ function renderChapterEditor(root) {
   const c = chapters[key];
   const box = collapsibleBox(`📖 第${key}章 ${esc(c.title)}（${(c.content || "").length} 字）`);
   box.id = "chapter-editor";
+  const titleCap = el("div", "caption", "章节标题");
+  const titleInput = el("input");
+  titleInput.type = "text";
+  titleInput.value = c.title || "";
+  titleInput.placeholder = "留空则无标题";
   const ta = el("textarea"); ta.rows = 20; ta.value = c.content;
   const status = el("div", "caption", "编辑后自动保存");
   let timer = null;
   const saveNow = async () => {
-    await saveSection("chapter", `chapter_${key}`, `第${key}章 ${c.title}\n${ta.value}`);
+    const title = titleInput.value.trim();
+    const r = await saveSection("chapter", `chapter_${key}`, `第${key}章 ${title}\n${ta.value}`);
     status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
+    // 账本失效衔接：只提示不自动补账（全部手动），同章 60s 节流
+    if (r && r.ledger_invalidated) {
+      const now = Date.now();
+      if ((lastLedgerWarn[key] || 0) + 60000 < now) {
+        lastLedgerWarn[key] = now;
+        // alertMsg("warn",
+        //   `✏️ 已编辑第${key}章，AI 账本中该章及之后 ${r.affected_chapters || 1} 章已作废（旧账基于旧正文，不可信）。`
+        //   + `生成下一章前会自动补账；也可到侧边栏「🧠 剧情账本」点「同步账本」立即补（约 ${r.affected_chapters || 1} 次调用）`, 12000);
+      }
+    }
   };
   // 重渲染前 flush：取消防抖立即落盘（saveSection 已同步内存，重渲染读到的是新内容）
   const flush = () => {
@@ -1889,25 +1916,23 @@ function renderChapterEditor(root) {
     clearTimeout(timer);
     timer = null;
     pendingSaves.delete(ta);
+    pendingSaves.delete(titleInput);
     return saveNow().catch((e) => { status.textContent = `保存失败：${e.message}`; });
   };
-  ta.oninput = () => {
+  const scheduleSave = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       timer = null;
       pendingSaves.delete(ta);
+      pendingSaves.delete(titleInput);
       try { await saveNow(); } catch (e) { status.textContent = `保存失败：${e.message}`; }
     }, 800);
     pendingSaves.set(ta, flush);
+    pendingSaves.set(titleInput, flush);
   };
+  ta.oninput = scheduleSave;
+  titleInput.oninput = scheduleSave;
   const ops = el("div", "row");
-  const reviewBtn = el("button", "btn small shrink", "📝 AI 评审");
-  reviewBtn.onclick = () => {
-    runGeneration("chapter_review", { chapter_num: +key, chapter_title: c.title, content: ta.value }, {
-      onDone: () => refreshNovel(true),
-    });
-  };
-  const reviseBtn = el("button", "btn small shrink", "🔧 按评审改写");
   // TODO 4.2 第3步：融入新设定重写本章（人工确认后整章重写）
   const rewriteBtn = el("button", "btn small shrink", "🔁 融入新设定重写");
   rewriteBtn.onclick = () => {
@@ -1915,7 +1940,7 @@ function renderChapterEditor(root) {
     if (!instruction || !instruction.trim()) return;
     if (!confirm(`将按新设定重写第${key}章并覆盖原内容，确定？`)) return;
     runGeneration("chapter", {
-      chapter_num: +key, chapter_title: c.title,
+      chapter_num: +key, chapter_title: titleInput.value.trim() || c.title,
       target_words: 2000, extra_instruction: instruction.trim(),
     }, { onDone: () => refreshNovel(true) });
   };
@@ -1926,33 +1951,8 @@ function renderChapterEditor(root) {
     chUI.activeKey = "";
     refreshNovel(true);
   };
-  ops.append(reviewBtn, reviseBtn, rewriteBtn, delBtn);
-  box.append(ta, status, ops);
-
-  // 评审结果（新结构 {review, hash} 带正文快照指纹；旧数据为纯字符串，兼容显示）
-  const reviewData = extra(`chapter_review_${key}`);
-  const reviewText = typeof reviewData === "string" ? reviewData : (reviewData?.review || "");
-  const reviewStale = reviewData && typeof reviewData === "object"
-    && typeof reviewData.hash === "string" && contentHash(ta.value) !== reviewData.hash;
-  if (reviewText) {
-    const rBox = el("div", "box");
-    rBox.innerHTML = `<h4>📝 评审结果</h4>
-      ${reviewStale ? `<div class="caption" style="color:#b45309">⚠️ 评审基于旧版本正文（当前正文已修改），意见可能不适用，请重新评审。</div>` : ""}
-      <div class="content-view">${esc(reviewText)}</div>`;
-    box.append(rBox);
-    if (reviewStale) {
-      reviseBtn.disabled = true;
-      reviseBtn.title = "评审已过期（正文已修改），请重新评审后再改写";
-    } else {
-      reviseBtn.onclick = () => {
-        if (!confirm("将按评审意见改写本章并覆盖原内容，确定？")) return;
-        runGeneration("chapter_revise", { chapter_num: +key, chapter_title: c.title, content: ta.value, review: reviewText });
-      };
-    }
-  } else {
-    reviseBtn.disabled = true;
-    reviseBtn.title = "请先评审";
-  }
+  ops.append(rewriteBtn, delBtn);
+  box.append(titleCap, titleInput, ta, status, ops);
 
   // 黄金开篇落选版本对比
   const golden = extra(`chapter_golden_${key}`);
@@ -2031,6 +2031,281 @@ function renderImpactScan(root) {
       }
     } catch (e) { alertMsg("error", e.message); }
   };
+  root.append(box);
+}
+
+// ---- AI 评审 Tab（评审 → 一键重写 → 一键替换/一键还原，含历史记录） ----
+const REVIEW_TYPES = [["world_setting", "🌍 世界观"], ["characters", "👤 人物"], ["outline", "📋 大纲"], ["chapter", "📖 章节"]];
+const RW_STATUS_LABEL = { draft: "草稿", applied: "✅ 已应用", restored: "↩️ 已还原", superseded: "⏸️ 已被覆盖" };
+const reviewUI = { type: "world_setting", chapter: "" };
+
+function fmtTime(ts) {
+  if (!ts) return "（旧数据）";
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function reviewCurrentContent(type) {
+  if (type === "chapter") return (S.novel.chapters?.[reviewUI.chapter]?.content) || "";
+  if (type === "world_setting") return S.novel.world_setting || "";
+  if (type === "characters") return S.novel.characters || "";
+  if (type === "outline") return S.novel.outline || "";
+  return "";
+}
+
+function reviewTypeLabel(type) {
+  return REVIEW_TYPES.find(([k]) => k === type)?.[1] || type;
+}
+
+function reviewTargetLabel(item) {
+  const base = reviewTypeLabel(item.type);
+  if (item.type === "chapter") return `${base} 第${item.chapter_num}章${item.chapter_title ? " " + item.chapter_title : ""}`;
+  return base;
+}
+
+// 某条评审记录对应的「当前内容」（章节记录取记录自身的章，而非 UI 当前选中章）
+function reviewCurrentContentFor(item) {
+  if (item.type === "chapter") return (S.novel.chapters?.[item.chapter_num]?.content) || "";
+  return reviewCurrentContent(item.type);
+}
+
+// 评审是否基于旧版本内容（正文/设定已修改 → 意见可能不适用，禁用一键重写）
+function isReviewStale(item) {
+  if (item.type === "chapter" && !S.novel.chapters?.[item.chapter_num]) return true;
+  if (!item.hash) return false;  // 无快照指纹的旧数据不判过期
+  return contentHash(reviewCurrentContentFor(item)) !== item.hash;
+}
+
+function rewriteFromReview(item) {
+  const snapshot = item.snapshot || reviewCurrentContentFor(item);
+  if (!snapshot.trim()) { alertMsg("error", "该评审对象已无内容，无法改写"); return; }
+  if (!confirm("将根据该条评审意见生成改写稿（生成后保存在下方「改写历史」，确认后再一键替换原文，不会直接覆盖）。继续？")) return;
+  const params = { type: item.type, content: snapshot, review: item.review || "", review_id: item.id };
+  if (item.type === "chapter") {
+    params.chapter_num = +item.chapter_num;
+    params.chapter_title = item.chapter_title || "";
+  }
+  runGeneration("content_rewrite", params, { onDone: () => refreshNovel(true) });
+}
+
+function tabReview(root) {
+  const chapters = S.novel.chapters || {};
+  const chKeys = Object.keys(chapters).sort((a, b) => +a - +b);
+  if (!chKeys.includes(reviewUI.chapter)) reviewUI.chapter = chKeys[0] || "";
+
+  // 对象选择
+  const selRow = el("div", "row");
+  const typeWrap = el("div");
+  typeWrap.innerHTML = `<label class="field">评审对象</label>`;
+  const typeSel = el("select");
+  typeSel.innerHTML = REVIEW_TYPES.map(([k, label]) => `<option value="${k}">${label}</option>`).join("");
+  typeSel.value = reviewUI.type;
+  typeSel.onchange = () => { reviewUI.type = typeSel.value; renderTabContent(); };
+  typeWrap.append(typeSel);
+  selRow.append(typeWrap);
+  const chWrap = el("div");
+  chWrap.innerHTML = `<label class="field">选择章节</label>`;
+  const chSel = el("select");
+  chSel.innerHTML = chKeys.map(k => `<option value="${k}">第${k}章 ${esc(chapters[k].title || "")}</option>`).join("");
+  chSel.value = reviewUI.chapter || "";
+  chSel.onchange = () => { reviewUI.chapter = chSel.value; renderTabContent(); };
+  chWrap.append(chSel);
+  chWrap.style.display = reviewUI.type === "chapter" ? "" : "none";
+  selRow.append(chWrap);
+  root.append(selRow);
+
+  // 当前内容预览（只读，评审以此刻内容为快照）
+  if (reviewUI.type === "chapter" && !chKeys.length) {
+    root.insertAdjacentHTML("beforeend", `<div class="msg info">还没有章节，请先到「章节」Tab 生成或导入章节。</div>`);
+  }
+  if (reviewUI.type === "characters" && !S.novel.characters) {
+    root.insertAdjacentHTML("beforeend", `<div class="msg info">当前没有自由文本人物设定（结构化角色卡模式时不在此评审）。如已生成角色卡，评审对象请选择其他类型。</div>`);
+  }
+  const contentTa = el("textarea");
+  contentTa.rows = 8;
+  contentTa.readOnly = true;
+  contentTa.value = reviewCurrentContent(reviewUI.type);
+  const cap = el("div", "caption", "以下为提交评审的内容快照（只读预览，评审基于此刻内容）");
+  root.append(cap, contentTa);
+
+  // 评审按钮
+  const btnRow = el("div", "row");
+  const reviewBtn = el("button", "btn primary", "📝 AI 评审");
+  const hasContent = contentTa.value.trim().length > 0;
+  reviewBtn.disabled = !hasContent;
+  reviewBtn.title = hasContent ? "" : "该对象暂无内容，请先在对应 Tab 生成";
+  reviewBtn.onclick = () => {
+    const type = reviewUI.type;
+    const params = { type, content: contentTa.value };
+    if (type === "chapter") {
+      params.chapter_num = +(reviewUI.chapter || chKeys[0] || 0);
+      params.chapter_title = chapters[params.chapter_num]?.title || "";
+    }
+    runGeneration("content_review", params, { onDone: () => refreshNovel(true) });
+  };
+  btnRow.append(reviewBtn);
+  root.append(btnRow);
+
+  renderReviewHistory(root);
+  renderRewriteHistory(root);
+  renderWholeBookConsistency(root);
+}
+
+// 全书一致性体检（原「一致性」Tab 并入）：逐对交叉比对设定 + 章节分批送检，
+// 与上方单对象评审互补（评审是单点质量，这里是全书审计）
+function renderWholeBookConsistency(root) {
+  const done = [S.novel.world_setting, S.novel.characters, S.novel.outline].filter(Boolean).length
+    + (Object.keys(S.novel.chapters || {}).length ? 1 : 0);
+  const box = el("div", "box");
+  box.innerHTML = `<h4>🔍 全书一致性体检</h4>
+    <div class="caption">检查设定之间的矛盾（世界观×人物×大纲逐对交叉比对）以及章节正文与设定/大纲的冲突（章节分批送检）。与上方单对象评审互补：评审看单点质量，体检做全书审计。</div>`;
+  const btn = el("button", "btn primary", "🚀 开始全书检查");
+  btn.style.marginTop = "8px";
+  btn.disabled = done < 2;
+  btn.title = done < 2 ? "至少需要完成两个步骤（世界观/人物/大纲/章节）才能检查" : "";
+  btn.onclick = () => runGeneration("consistency", {}, { onDone: () => refreshNovel(true) });
+  box.append(btn);
+  const result = extra("consistency_result");
+  if (result) {
+    const det = el("details");
+    det.style.marginTop = "8px";
+    det.innerHTML = `<summary class="caption">📋 上次检查结果（${(result || "").length} 字）</summary><div class="content-view preview-scroll">${esc(result)}</div>`;
+    const clear = el("button", "btn small shrink", "🗑️ 清除结果");
+    clear.style.marginLeft = "6px";
+    clear.onclick = async () => { await delExtra("consistency_result"); refreshNovel(true); };
+    det.querySelector("summary").append(clear);
+    box.append(det);
+  }
+  root.append(box);
+}
+
+function renderReviewHistory(root) {
+  const history = (extra("ai_review_history", null) || []).slice()
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  const box = el("div", "box");
+  box.innerHTML = `<h4>🗂️ 评审历史（${history.length} 条）</h4>
+    <div class="caption">每条评审保留评审时的内容快照；内容被修改后该条会标记「已过期」，过期评审不能一键重写。</div>`;
+  if (!history.length) {
+    box.innerHTML += `<div class="caption">暂无评审记录</div>`;
+    root.append(box);
+    return;
+  }
+  for (const item of history) {
+    const stale = isReviewStale(item);
+    const det = el("details", "box");
+    det.style.marginTop = "6px";
+    det.innerHTML = `<summary><b>${esc(reviewTargetLabel(item))}</b> <span class="caption">${fmtTime(item.created_at)}</span>
+      ${stale ? `<span class="caption" style="color:#b45309">⚠️ 已过期</span>` : ""}
+      <span class="caption">（${(item.review || "").length} 字）</span></summary>`;
+    if (stale) {
+      det.insertAdjacentHTML("beforeend",
+        `<div class="caption" style="color:#b45309">⚠️ 该评审基于旧版本内容（当前内容已修改），意见可能不适用，请重新评审。</div>`);
+    }
+    const view = el("div", "content-view preview-scroll");
+    view.textContent = item.review || "";
+    det.append(view);
+    const ops = el("div", "row");
+    ops.style.marginTop = "8px";
+    const rwBtn = el("button", "btn small shrink", "🔧 一键重写");
+    rwBtn.disabled = stale;
+    rwBtn.title = stale ? "评审已过期（内容已修改），请重新评审后再改写" : "按该评审意见生成改写稿（不直接覆盖原文）";
+    rwBtn.onclick = () => rewriteFromReview(item);
+    const delBtn = el("button", "btn small shrink", "🗑️ 删除");
+    delBtn.onclick = async () => {
+      if (!confirm("删除该条评审记录？（其生成的改写稿不受影响）")) return;
+      try {
+        await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-review-history/${encodeURIComponent(item.legacy_key || item.id)}`, { method: "DELETE" });
+        refreshNovel(true);
+      } catch (e) { alertMsg("error", `删除失败：${e.message}`); }
+    };
+    ops.append(rwBtn, delBtn);
+    det.append(ops);
+    box.append(det);
+  }
+  root.append(box);
+}
+
+function renderRewriteHistory(root) {
+  const history = (extra("ai_rewrite_history", null) || []).slice()
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  const reviews = extra("ai_review_history", null) || [];
+  const box = el("div", "box");
+  box.innerHTML = `<h4>✍️ 改写历史（${history.length} 条）</h4>
+    <div class="caption">改写稿默认不覆盖原文：点「一键替换」才写入正文；替换后可「一键还原」回到替换前版本，可无限往返。草稿可直接编辑。</div>`;
+  if (!history.length) {
+    box.innerHTML += `<div class="caption">暂无改写记录（先评审，再点评审旁的「一键重写」）</div>`;
+    root.append(box);
+    return;
+  }
+  for (const item of history) {
+    const det = el("div", "box");
+    det.style.marginTop = "6px";
+    const status = RW_STATUS_LABEL[item.status] || item.status;
+    const revRef = reviews.find(r => r.id === item.review_id);
+    det.innerHTML = `<h4 style="margin:0">${esc(reviewTargetLabel(item))} · <span class="caption">${status}</span>
+      <span class="caption" style="font-weight:normal">${fmtTime(item.created_at)}</span></h4>`;
+    if (item.review_id) {
+      det.insertAdjacentHTML("beforeend", `<div class="caption">基于评审：${esc(revRef ? reviewTargetLabel(revRef) + " " + fmtTime(revRef.created_at) : item.review_id)}</div>`);
+    }
+    const ta = el("textarea");
+    ta.rows = 8;
+    ta.value = item.content || "";
+    if (item.status === "applied") ta.readOnly = true;
+    det.append(ta);
+    const ops = el("div", "row");
+    ops.style.marginTop = "6px";
+    const applied = item.status === "applied";
+    const applyBtn = el("button", applied ? "btn primary small shrink" : "btn small shrink",
+      applied ? "↩️ 一键还原" : "✅ 一键替换");
+    applyBtn.onclick = async () => {
+      try {
+        if (!applied) {
+          if (!confirm(`将用该改写稿替换当前${reviewTargetLabel(item)}内容（替换前原文快照自动保留，可一键还原）。确定？`)) return;
+          if (ta.value !== (item.content || "")) {
+            await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-rewrite-history/${encodeURIComponent(item.id)}`,
+              { method: "PUT", body: { content: ta.value } });
+          }
+          await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-rewrite/apply`, { method: "POST", body: { rewrite_id: item.id } });
+          alertMsg("success", "✅ 已替换到正文");
+          if (item.type !== "chapter") {
+            alertMsg("warn", "⚠️ 设定已变更，建议到「章节」Tab 使用「新增设定回溯扫描」检查已生成章节是否受影响", 12000);
+          }
+        } else {
+          if (!confirm("将恢复为替换前的版本（改写稿保留在历史中，可再次替换）。确定？")) return;
+          await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-rewrite/restore`, { method: "POST", body: { rewrite_id: item.id } });
+          alertMsg("success", "↩️ 已还原为替换前版本");
+        }
+        refreshNovel(true);
+      } catch (e) { alertMsg("error", `${applied ? "还原" : "替换"}失败：${e.message}`); }
+    };
+    ops.append(applyBtn);
+    if (!applied) {
+      const saveBtn = el("button", "btn small shrink", "💾 保存编辑");
+      saveBtn.onclick = async () => {
+        try {
+          await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-rewrite-history/${encodeURIComponent(item.id)}`,
+            { method: "PUT", body: { content: ta.value } });
+          alertMsg("success", "已保存编辑");
+          refreshNovel(true);
+        } catch (e) { alertMsg("error", `保存失败：${e.message}`); }
+      };
+      ops.append(saveBtn);
+    }
+    const delBtn = el("button", "btn small shrink", "🗑️ 删除");
+    delBtn.disabled = applied;
+    delBtn.title = applied ? "已应用的版本是「一键还原」的依据，请先还原再删除" : "删除该条改写记录（不影响当前正文）";
+    delBtn.onclick = async () => {
+      if (!confirm("删除该条改写记录？（不影响当前正文）")) return;
+      try {
+        await api(`/api/novels/${encodeURIComponent(S.novelId)}/ai-rewrite-history/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+        refreshNovel(true);
+      } catch (e) { alertMsg("error", `删除失败：${e.message}`); }
+    };
+    ops.append(delBtn);
+    det.append(ops);
+    box.append(det);
+  }
   root.append(box);
 }
 
@@ -2205,30 +2480,6 @@ function tabPolish(root) {
 }
 
 // ---- 一致性 Tab ----
-function tabConsistency(root) {
-  const done = [S.novel.world_setting, S.novel.characters, S.novel.outline].filter(Boolean).length
-    + (Object.keys(S.novel.chapters || {}).length ? 1 : 0);
-  if (done < 2) {
-    root.innerHTML = `<div class="msg warn">⚠️ 至少需要完成两个步骤（世界观/人物/大纲/章节）才能进行一致性检查。</div>`;
-    return;
-  }
-  const box = el("div", "box");
-  box.innerHTML = `<h4>🔍 AI 一致性检查</h4>
-    <div class="caption">检查设定之间的矛盾、章节正文与设定/大纲的冲突（章节分批送检）</div>`;
-  const btn = el("button", "btn primary", "🚀 开始检查");
-  btn.style.marginTop = "8px";
-  btn.onclick = () => runGeneration("consistency", {});
-  box.append(btn);
-  const result = extra("consistency_result");
-  if (result) {
-    box.innerHTML += `<div class="divider"></div><h4>上次检查结果</h4><div class="content-view">${esc(result)}</div>`;
-    const clear = el("button", "btn small", "🗑️ 清除结果");
-    clear.onclick = async () => { await delExtra("consistency_result"); refreshNovel(true); };
-    box.append(clear);
-  }
-  root.append(box);
-}
-
 // ---- 查找替换 Tab ----
 function tabFindReplace(root) {
   const hasContent = S.novel.world_setting || S.novel.characters || S.novel.outline
@@ -2643,7 +2894,7 @@ function renderTabContent() {
   const key = TABS[S.activeTab][1];
   ({
     world: tabWorld, characters: tabCharacters, outline: tabOutline, chapter: tabChapter,
-    continue: tabContinue, polish: tabPolish, consistency: tabConsistency,
+    review: tabReview, continue: tabContinue, polish: tabPolish,
     findreplace: tabFindReplace, graph: tabGraph, export: tabExport, skills: tabSkills,
   })[key](root);
 }
@@ -2651,6 +2902,7 @@ function renderTabContent() {
 function renderAll() {
   renderProgress();
   renderTabs();
+  renderMemorySidebar();
   renderTabContent();
   renderCurrentNovelCard();
 }

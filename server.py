@@ -51,11 +51,26 @@ DEFAULT_MAX_TOKENS = {
     "continue": 8000, "polish": 8000, "consistency": 6000, "relation_graph": 6000,
     "extend_outline": 8000, "volume_chapters": 8000, "rewrite_outline": 6000,
     "migrate_cards": 6000, "memory_rebuild": 4000, "rewrite_preview": 2000,
+    "content_review": 3000, "content_rewrite": 8000,
 }
 
 # 评审快照内容指纹（CRC32，与前端 web/app.js 的 crc32 实现一致，用于判断评审是否过期）
 def _content_hash(text: str) -> str:
     return format(zlib.crc32(text.encode("utf-8")), "08x")
+
+# AI 评审 Tab 可评审/可改写的对象类型
+REVIEWABLE_TYPES = ("outline", "world_setting", "characters", "chapter")
+
+
+def _make_history_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def _append_history(store: JsonNovelStore, key: str, entry: dict):
+    """向 extra 历史列表追加一条记录（ai_review_history / ai_rewrite_history）"""
+    items = [i for i in (store.load_extra_data(key, []) or []) if isinstance(i, dict)]
+    items.append(entry)
+    store.save_extra_data(key, items)
 
 # ---------- API 客户端缓存（按激活配置） ----------
 
@@ -71,6 +86,8 @@ def _build_client(provider: dict) -> LLMAPIClient:
         max_output=provider.get("max_output") or None,
         reasoning_effort=provider.get("reasoning_effort") or None,
         thinking_disabled=bool(provider.get("thinking_disabled")),
+        reasoning=bool(provider.get("reasoning")),
+        thinking_disable_supported=bool(provider.get("thinking_disable")),
     )
 
 
@@ -84,7 +101,8 @@ def get_client(fresh: bool = False) -> LLMAPIClient:
         return _build_client(provider)
     key = (provider.get("api_key"), provider.get("api_base"), provider.get("model"),
            provider.get("max_output"), provider.get("reasoning_effort"),
-           provider.get("thinking_disabled"))
+           provider.get("thinking_disabled"), provider.get("reasoning"),
+           provider.get("thinking_disable"))
     with _client_lock:
         if _client_cache["key"] != key:
             _client_cache["client"] = _build_client(provider)
@@ -226,6 +244,12 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
         mt = int(params.get("max_tokens") or
                  user_config.get_max_tokens_overrides().get(step) or
                  DEFAULT_MAX_TOKENS.get(step, 4000))
+        # 推理模型且思考实际未关闭（含勾选了关闭思考但接口忽略的情况）：思考占用输出额度，
+        # 自动放大预算，避免正文被思考挤掉（API返回空内容）
+        thinking_effectively_off = (getattr(client, "thinking_disabled", False)
+                                    and getattr(client, "thinking_disable_supported", True))
+        if getattr(client, "is_reasoning", False) and not thinking_effectively_off:
+            mt = min(int(mt * 3), client.MAX_TOKENS_LIMIT)
         result_payload = {}
         warning = ""
 
@@ -365,6 +389,58 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             vs.save_extra_data(f"chapter_review_{chapter_num}", {
                 "review": review, "hash": _content_hash(content)})
             result_payload["review"] = review
+
+        elif step == "content_review":
+            # AI 评审 Tab：评审 大纲/世界观/人物/章节，结果入历史（ai_review_history）
+            ctype = params.get("type", "")
+            if ctype not in REVIEWABLE_TYPES:
+                raise ValueError(f"不支持的评审类型: {ctype}")
+            content = params.get("content", "")
+            if not content.strip():
+                raise ValueError("没有可评审的内容")
+            chapter_num = int(params.get("chapter_num") or 0) or None
+            chapter_title = params.get("chapter_title", "")
+            review = workflow.review_content(ctype, content, chapter_num=chapter_num,
+                                             chapter_title=chapter_title, max_tokens=mt)
+            entry = {
+                "id": _make_history_id("rev"), "type": ctype,
+                "chapter_num": chapter_num, "chapter_title": chapter_title,
+                "snapshot": content, "hash": _content_hash(content),
+                "review": review, "created_at": time.time(),
+            }
+            _append_history(vs, "ai_review_history", entry)
+            if ctype == "chapter" and chapter_num:
+                # 旧单条评审已迁入历史（含快照），删除旧键避免双份展示
+                vs.delete_extra_field(f"chapter_review_{chapter_num}")
+            result_payload["review_id"] = entry["id"]
+            result_payload["review"] = review
+
+        elif step == "content_rewrite":
+            # AI 评审 Tab：按评审意见一键重写（不覆盖原文，入历史待用户确认替换）
+            ctype = params.get("type", "")
+            if ctype not in REVIEWABLE_TYPES:
+                raise ValueError(f"不支持的改写类型: {ctype}")
+            content = params.get("content", "")
+            review = params.get("review", "")
+            if not content.strip() or not review.strip():
+                raise ValueError("需要先评审再改写")
+            chapter_num = int(params.get("chapter_num") or 0) or None
+            chapter_title = params.get("chapter_title", "")
+            if ctype == "chapter" and not chapter_num:
+                raise ValueError("改写章节需要指定章节号")
+            rewritten = workflow.rewrite_by_review(ctype, content, review, chapter_num=chapter_num,
+                                                   chapter_title=chapter_title, max_tokens=mt)
+            if is_ai_refusal(rewritten):
+                raise ValueError("AI拒绝了本次改写请求，请修改内容后重试")
+            entry = {
+                "id": _make_history_id("rw"), "type": ctype,
+                "review_id": params.get("review_id", ""),
+                "chapter_num": chapter_num, "chapter_title": chapter_title,
+                "content": rewritten, "status": "draft", "created_at": time.time(),
+            }
+            _append_history(vs, "ai_rewrite_history", entry)
+            result_payload["rewrite_id"] = entry["id"]
+            result_payload["result"] = rewritten
 
         elif step == "extend_outline":
             # TODO 3.1：增量扩展大纲（旧大纲逐字保留）
@@ -551,6 +627,12 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
         if getattr(client, "thinking_disable_ignored", False):
             td_warn = "⚠️ 已请求关闭思考，但模型仍在输出思考内容——该服务商可能不支持 thinking 参数"
             result_payload["warning"] = (result_payload.get("warning", "") + "；" + td_warn).strip("；")
+            # 自愈：该服务商实际不关闭思考 → 写回能力标记，后续任务自动按"思考开启"放大预算
+            if provider and provider.get("name"):
+                try:
+                    user_config.update_provider_fields(provider["name"], {"thinking_disable": False})
+                except Exception:
+                    pass
         emit("done", result_payload)
     except ChapterPaused as e:
         # 用户暂停/取消：进度已保存，不加"已有内容保持不变"后缀
@@ -859,6 +941,23 @@ def get_novel(novel_id: str):
         if fixed != outline:
             store.add_section("outline", "full_outline", fixed)
             data["outline"] = fixed
+    # 旧单条评审（chapter_review_{N}）合并进 ai_review_history，供 AI 评审 Tab 统一展示/删除
+    extra = data.get("extra", {})
+    history = [i for i in (extra.get("ai_review_history") or []) if isinstance(i, dict)]
+    for k in sorted(extra):
+        if not k.startswith("chapter_review_"):
+            continue
+        v = extra[k]
+        num = k.rsplit("_", 1)[1]
+        history.append({
+            "id": f"legacy_{k}", "legacy_key": k, "type": "chapter",
+            "chapter_num": int(num) if num.isdigit() else 0, "chapter_title": "",
+            "snapshot": "", "hash": (v.get("hash", "") if isinstance(v, dict) else ""),
+            "review": (v.get("review", "") if isinstance(v, dict) else v),
+            "created_at": None,
+        })
+    extra["ai_review_history"] = history
+    data["extra"] = extra
     return data
 
 
@@ -891,16 +990,26 @@ class SectionIn(BaseModel):
 
 @app.put("/api/novels/{novel_id}/section")
 def put_section(novel_id: str, sec: SectionIn):
-    get_store(novel_id).update_section(sec.type, sec.title, sec.content)
+    store = get_store(novel_id)
+    old = store.get_section(sec.type, sec.title)
+    store.update_section(sec.type, sec.title, sec.content)
     # 手动编辑章节正文 → 触发记忆失效处理（TODO 1.1：编辑保存处挂钩）
     if sec.type == "chapter":
         m = re.match(r"chapter_(\d+)", sec.title)
         if m:
+            # 内容未变（防抖自动保存重复提交）→ 跳过记忆失效，避免反复作废账本/写盘
+            if old is not None and _content_hash(old) == _content_hash(sec.content):
+                return {"ok": True, "ledger_invalidated": False}
             wf = get_store_workflow(novel_id)
             body = sec.content.split("\n", 1)
             ch = wf.novel_info.setdefault("chapters", {})
             ch[m.group(1)] = {"title": "", "content": body[1] if len(body) > 1 else sec.content}
             wf.invalidate_memory_from(int(m.group(1)))
+            # 受影响章数 = 该章及之后仍有正文的章（账本需补账的范围）
+            later = [k for k, v in wf.novel_info.get("chapters", {}).items()
+                     if str(k).isdigit() and int(k) >= int(m.group(1))
+                     and (v.get("content") or "").strip()]
+            return {"ok": True, "ledger_invalidated": True, "affected_chapters": len(later)}
     return {"ok": True}
 
 
@@ -915,7 +1024,187 @@ def delete_section(novel_id: str, type: str, title: str):
             num = m.group(1)
             store.delete_extra_field(f"chapter_review_{num}")
             store.delete_extra_field(f"chapter_golden_{num}")
+            # AI 评审 Tab 历史中该章的孤儿记录一并清理
+            for key in ("ai_review_history", "ai_rewrite_history"):
+                items = [i for i in (store.load_extra_data(key, []) or []) if isinstance(i, dict)]
+                kept = [i for i in items if str(i.get("chapter_num", "")) != num]
+                if len(kept) != len(items):
+                    store.save_extra_data(key, kept)
     return {"ok": True}
+
+
+# ---------- AI 评审 Tab：评审/改写历史 CRUD + 一键替换/一键还原 ----------
+
+class RewriteEditIn(BaseModel):
+    content: str = ""
+
+
+@app.delete("/api/novels/{novel_id}/ai-review-history/{rid}")
+def delete_review_history(novel_id: str, rid: str):
+    """删除一条评审历史记录；旧单条评审（chapter_review_{N}）直接删对应 extra 键"""
+    store = get_store(novel_id)
+    if rid.startswith("legacy_"):
+        rid = rid[len("legacy_"):]
+    if rid.startswith("chapter_review_"):
+        if store.load_extra_data(rid, None) is None:
+            raise HTTPException(404, "评审记录不存在")
+        store.delete_extra_field(rid)
+        return {"ok": True}
+    items = [i for i in (store.load_extra_data("ai_review_history", []) or []) if isinstance(i, dict)]
+    kept = [i for i in items if i.get("id") != rid]
+    if len(kept) == len(items):
+        raise HTTPException(404, "评审记录不存在")
+    store.save_extra_data("ai_review_history", kept)
+    return {"ok": True}
+
+
+@app.put("/api/novels/{novel_id}/ai-rewrite-history/{rid}")
+def edit_rewrite_history(novel_id: str, rid: str, body: RewriteEditIn):
+    """编辑改写稿（草稿态可编辑；已应用的版本是还原依据，禁止编辑）"""
+    content = (body.content or "").strip()
+    if not content:
+        raise HTTPException(400, "改写内容不能为空")
+    store = get_store(novel_id)
+    items = [i for i in (store.load_extra_data("ai_rewrite_history", []) or []) if isinstance(i, dict)]
+    entry = next((i for i in items if i.get("id") == rid), None)
+    if not entry:
+        raise HTTPException(404, "改写记录不存在")
+    if entry.get("status") == "applied":
+        raise HTTPException(400, "已应用的版本是「一键还原」的依据，请先还原后再编辑")
+    entry["content"] = content
+    store.save_extra_data("ai_rewrite_history", items)
+    return {"ok": True, "entry": entry}
+
+
+@app.delete("/api/novels/{novel_id}/ai-rewrite-history/{rid}")
+def delete_rewrite_history(novel_id: str, rid: str):
+    """删除一条改写记录；已应用的版本禁止删除（会失去还原依据）"""
+    store = get_store(novel_id)
+    items = [i for i in (store.load_extra_data("ai_rewrite_history", []) or []) if isinstance(i, dict)]
+    entry = next((i for i in items if i.get("id") == rid), None)
+    if not entry:
+        raise HTTPException(404, "改写记录不存在")
+    if entry.get("status") == "applied":
+        raise HTTPException(400, "该版本已应用到正文，请先「一键还原」再删除（还原后正文回到替换前版本）")
+    store.save_extra_data("ai_rewrite_history", [i for i in items if i.get("id") != rid])
+    return {"ok": True}
+
+
+def _apply_or_restore_target(store, entry):
+    """返回 (type, chapter_num) 校验改写记录可执行性"""
+    ctype = entry.get("type", "")
+    if ctype not in REVIEWABLE_TYPES or not (entry.get("content") or "").strip():
+        raise HTTPException(400, "改写记录数据异常，无法替换")
+    if ctype == "chapter":
+        num = int(entry.get("chapter_num") or 0)
+        if num <= 0:
+            raise HTTPException(400, "章节改写记录缺少章节号")
+    return ctype
+
+
+def _apply_rewrite_content(workflow, store, ctype, content, chapter_num=None, chapter_title=""):
+    """把改写稿写入对应 section（章节联动台账失效），返回替换前的原文内容"""
+    if ctype == "chapter":
+        ch = workflow.novel_info.get("chapters", {}).get(str(chapter_num), {})
+        title = chapter_title or ch.get("title") or ""
+        original = ch.get("content") or ""
+        store.update_section("chapter", f"chapter_{chapter_num}", f"第{chapter_num}章 {title}\n{content}")
+        workflow.novel_info.setdefault("chapters", {})[str(chapter_num)] = {"title": title, "content": content}
+        workflow.invalidate_memory_from(chapter_num)
+    elif ctype == "outline":
+        original = workflow.novel_info.get("outline") or store.get_section("outline", "full_outline") or ""
+        store.update_section("outline", "full_outline", content)
+        workflow.novel_info["outline"] = content
+    elif ctype == "world_setting":
+        original = workflow.novel_info.get("world_setting") or store.get_section("setting", "world_setting") or ""
+        store.update_section("setting", "world_setting", content)
+        workflow.novel_info["world_setting"] = content
+    elif ctype == "characters":
+        original = workflow.novel_info.get("characters") or store.get_section("character", "all_characters") or ""
+        store.update_section("character", "all_characters", content)
+        workflow.novel_info["characters"] = content
+    else:
+        raise HTTPException(400, f"不支持的替换类型: {ctype}")
+    return original
+
+
+@app.post("/api/novels/{novel_id}/ai-rewrite/apply")
+def apply_rewrite(novel_id: str, body: dict):
+    """一键替换：把改写稿写入正文。替换前自动保留原文快照（供一键还原），
+    章节替换联动台账失效重建；旧已应用版本标记为被覆盖（版本链可无限往返）。"""
+    rid = (body.get("rewrite_id") or "").strip()
+    if not rid:
+        raise HTTPException(400, "缺少 rewrite_id")
+    store = get_store(novel_id)
+    items = [i for i in (store.load_extra_data("ai_rewrite_history", []) or []) if isinstance(i, dict)]
+    entry = next((i for i in items if i.get("id") == rid), None)
+    if not entry:
+        raise HTTPException(404, "改写记录不存在")
+    if entry.get("status") == "applied":
+        raise HTTPException(400, "该版本已经应用到正文")
+    _apply_or_restore_target(store, entry)
+    wf = get_store_workflow(novel_id)
+    original = _apply_rewrite_content(
+        wf, store, entry["type"], entry["content"],
+        chapter_num=entry.get("chapter_num"), chapter_title=entry.get("chapter_title", ""))
+    entry["original_snapshot"] = original
+    entry["original_hash"] = _content_hash(original)
+    entry["status"] = "applied"
+    entry["applied_at"] = time.time()
+    for it in items:
+        if it.get("id") != rid and it.get("status") == "applied":
+            it["status"] = "superseded"
+    store.save_extra_data("ai_rewrite_history", items)
+    return {"ok": True, "entry": entry}
+
+
+@app.post("/api/novels/{novel_id}/ai-rewrite/restore")
+def restore_rewrite(novel_id: str, body: dict):
+    """一键还原：把替换前快照写回正文（版本链回退，改写稿保留可再次替换）。
+    仅当当前正文确实等于该改写版本时允许还原，防止误覆盖后续改动。"""
+    rid = (body.get("rewrite_id") or "").strip()
+    if not rid:
+        raise HTTPException(400, "缺少 rewrite_id")
+    store = get_store(novel_id)
+    items = [i for i in (store.load_extra_data("ai_rewrite_history", []) or []) if isinstance(i, dict)]
+    entry = next((i for i in items if i.get("id") == rid), None)
+    if not entry:
+        raise HTTPException(404, "改写记录不存在")
+    if entry.get("status") != "applied":
+        raise HTTPException(400, "该版本当前未应用到正文，无需还原")
+    original = entry.get("original_snapshot")
+    if original is None:
+        raise HTTPException(400, "该版本缺少替换前快照，无法还原")
+    _apply_or_restore_target(store, entry)
+    wf = get_store_workflow(novel_id)
+    ctype = entry["type"]
+    chapter_num = entry.get("chapter_num")
+    # 校验当前正文确实是该改写版本（正文可能已被其他操作改动）
+    if ctype == "chapter":
+        current = wf.novel_info.get("chapters", {}).get(str(chapter_num), {}).get("content", "")
+    elif ctype == "outline":
+        current = wf.novel_info.get("outline") or store.get_section("outline", "full_outline") or ""
+    elif ctype == "world_setting":
+        current = wf.novel_info.get("world_setting") or store.get_section("setting", "world_setting") or ""
+    elif ctype == "characters":
+        current = wf.novel_info.get("characters") or store.get_section("character", "all_characters") or ""
+    else:
+        raise HTTPException(400, f"不支持的还原类型: {ctype}")
+    if _content_hash(current) != _content_hash(entry.get("content", "")):
+        raise HTTPException(400, "当前正文与该改写版本不一致（已被其他操作修改），无法一键还原，请手动处理")
+    _apply_rewrite_content(wf, store, ctype, original, chapter_num=chapter_num,
+                           chapter_title=entry.get("chapter_title", ""))
+    entry["status"] = "restored"
+    entry["applied_at"] = None
+    # 若原文恰好等于另一条历史版本的内容，把那条标记回 applied（保持版本链不变量）
+    orig_hash = _content_hash(original)
+    for it in items:
+        if it.get("id") != rid and it.get("status") in ("superseded", "draft") \
+                and _content_hash(it.get("content", "")) == orig_hash:
+            it["status"] = "applied"
+            break
+    store.save_extra_data("ai_rewrite_history", items)
+    return {"ok": True, "entry": entry}
 
 
 class ChapterSummariesIn(BaseModel):

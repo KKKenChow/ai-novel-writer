@@ -402,6 +402,80 @@ def test_thinking_disabled_default_off(monkeypatch):
     assert "thinking" not in sent
 
 
+# ---------- hy3 式响应兼容：reasoning 字段 / 思考吃光预算自动放大 ----------
+
+def test_reasoning_field_empty_content_auto_retry_bigger(monkeypatch):
+    """hy3 式：响应只回 reasoning 字段、正文为空(finish_reason=length) →
+    自动放大 max_tokens ×3 重试一次，正文得以输出；且 thinking_disable_ignored 置位"""
+    sent_tokens = []
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        sent_tokens.append(json["max_tokens"])
+        if len(sent_tokens) == 1:
+            p = {"choices": [{"index": 0, "finish_reason": "length",
+                              "message": {"role": "assistant", "content": None,
+                                          "reasoning": "思考了很久..."}}],
+                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            return FakeResp(200, p)
+        return FakeResp(200, ok_payload("正文"))
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(user_config, "CONFIG_PATH", "/nonexistent/x.json")
+    c = LLMAPIClient(api_key="k", api_base="http://x", model="m",
+                     thinking_disabled=True, max_output=65536)
+    out = c.chat([{"role": "user", "content": "hi"}], max_tokens=1000)
+    assert out == "正文"
+    assert sent_tokens == [1000, 3000]  # ×3 放大一次
+    assert c.thinking_disable_ignored is True
+    assert c.thinking_disable_supported is False  # 运行时确认该接口不支持关闭思考
+
+
+def test_auto_retry_bigger_bounded_once(monkeypatch):
+    """放大重试只做一次：仍为空则抛错，不无限重试"""
+    sent_tokens = []
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        sent_tokens.append(json["max_tokens"])
+        p = {"choices": [{"index": 0, "finish_reason": "length",
+                          "message": {"role": "assistant", "content": "",
+                                      "reasoning": "思考"}}],
+             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        return FakeResp(200, p)
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(user_config, "CONFIG_PATH", "/nonexistent/x.json")
+    c = LLMAPIClient(api_key="k", api_base="http://x", model="m", max_output=65536)
+    with pytest.raises(Exception, match="API返回空内容"):
+        c.chat([{"role": "user", "content": "hi"}], max_tokens=1000)
+    assert sent_tokens == [1000, 3000]  # 只放大一次
+
+
+def test_probe_reasoning_recognizes_reasoning_field(monkeypatch):
+    """探测：hy3 用 reasoning 字段也应识别为推理模型"""
+    reasoning_payload = {
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": "2", "reasoning": "..."}}]}
+    monkeypatch.setattr("requests.post", lambda *a, **kw: FakeResp(200, reasoning_payload))
+    c = LLMAPIClient(api_key="k", api_base="http://x", model="m")
+    caps = c._probe_reasoning({}, 5)
+    assert caps["reasoning"] is True
+
+
+def test_stream_reasoning_field_recognized(monkeypatch):
+    """流式：delta.reasoning（hy3 式）应走 reasoning_callback，且 ignored 告警触发"""
+    resp = FakeStreamResp(_sse([
+        {"choices": [{"delta": {"reasoning": "先想想"}}]},
+        {"choices": [{"delta": {"content": "正文"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+    ]))
+    monkeypatch.setattr("requests.post", lambda *a, **kw: resp)
+    monkeypatch.setattr(user_config, "CONFIG_PATH", "/nonexistent/x.json")
+    c = LLMAPIClient(api_key="k", api_base="http://x", model="m", thinking_disabled=True)
+    reasoning_parts = []
+    out = c.chat([{"role": "user", "content": "hi"}], stream_callback=lambda t: None,
+                 reasoning_callback=reasoning_parts.append)
+    assert out == "正文"
+    assert "".join(reasoning_parts) == "先想想"
+    assert c.thinking_disable_ignored is True
+    assert c.thinking_disable_supported is False  # 流式路径同样翻转
+
+
 def test_cancel_before_and_during_stream(monkeypatch):
     """取消：cancel_check 返回 True 时流式循环立即中断，抛 GenerationCancelled"""
     resp = FakeStreamResp(_sse([{"choices": [{"delta": {"content": "x"}}]}] * 100))
@@ -418,15 +492,41 @@ def test_cancel_before_and_during_stream(monkeypatch):
 
 
 def test_probe_thinking_disable_supported(monkeypatch):
-    """探测：思考模型且 thinking 参数被接受 → caps.thinking_disable=True"""
+    """探测：思考模型且关闭思考参数真的生效（响应无思考）→ caps.thinking_disable=True"""
     reasoning_payload = {
         "choices": [{"index": 0, "finish_reason": "stop",
                      "message": {"role": "assistant", "content": "2",
                                  "reasoning_content": "..."}}]}
-    monkeypatch.setattr("requests.post", lambda *a, **kw: FakeResp(200, reasoning_payload))
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        if (json or {}).get("thinking"):
+            return FakeResp(200, ok_payload("2"))  # 关闭思考生效：响应无思考
+        return FakeResp(200, reasoning_payload)
+    monkeypatch.setattr("requests.post", fake_post)
     c = LLMAPIClient(api_key="k", api_base="http://x", model="m")
     caps = c._probe_reasoning({}, 5)
+    assert caps["reasoning"] is True
+    assert caps["reasoning_effort_options"] == ["low", "medium", "high"]
     assert caps.get("thinking_disable") is True
+
+
+def test_probe_thinking_disable_ignored_when_still_reasoning(monkeypatch):
+    """探测：请求关闭思考后响应仍含思考（hy3 式：参数被接受但被忽略）→ 判定不支持关闭思考"""
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        if (json or {}).get("thinking"):
+            p = {"choices": [{"index": 0, "finish_reason": "stop",
+                              "message": {"role": "assistant", "content": "2",
+                                          "reasoning": "还是思考"}}]}
+            return FakeResp(200, p)
+        reasoning_payload = {
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "2",
+                                     "reasoning_content": "..."}}]}
+        return FakeResp(200, reasoning_payload)
+    monkeypatch.setattr("requests.post", fake_post)
+    c = LLMAPIClient(api_key="k", api_base="http://x", model="m")
+    caps = c._probe_reasoning({}, 5)
+    assert caps["reasoning"] is True
+    assert caps.get("thinking_disable") is False
 
 
 # ---- 断点 bug A/B 回归 ----
@@ -502,3 +602,46 @@ def test_bug_b_beats_whitespace_normalized():
     }
     result = wf.generate_chapter(1, "初入都市", max_tokens=16000, target_words=600, beats=BEATS3)
     assert "场景一正文" in result  # 断点命中并复用，未被当成不一致
+
+
+# ---- 断点兜底：无 beats 时的采用/清理 + 失败弹窗丢弃选项 ----
+
+def test_generate_without_beats_adopts_partial_beats_and_asks():
+    """生成本章时无节拍但存在有进度断点 → 自动载入断点节拍并弹询问（不再静默从头生成）"""
+    asked = []
+    def confirm(msg, opts):
+        asked.append(msg)
+        return "resume"
+    wf = make_wf(["场景二正文。" * 100, "场景三正文。" * 100], confirm=confirm)
+    wf.vs.extra["chapter_partial_1"] = {
+        "chapter_num": 1, "title": "初入都市", "beats_text": BEATS3,
+        "parts": ["场景一正文。" * 100],
+    }
+    result = wf.generate_chapter(1, "初入都市", max_tokens=16000, target_words=600)
+    assert asked  # 确实弹了询问
+    assert "场景一正文" in result  # 从断点续写
+    assert len(wf.api.prompts) == 2  # 只补写 2 个场景
+    assert "chapter_partial_1" not in wf.vs.extra  # 完成后断点清除
+
+
+def test_empty_parts_partial_cleaned_when_no_beats():
+    """无节拍且断点 0 场景（空进度）→ 自动清理，不留残留提示"""
+    wf = make_wf(["场景一正文。" * 100, "场景二正文。" * 100, "场景三正文。" * 100])
+    wf.vs.extra["chapter_partial_1"] = {
+        "chapter_num": 1, "title": "初入都市", "beats_text": BEATS3, "parts": [],
+    }
+    wf.generate_chapter(1, "初入都市", max_tokens=16000, target_words=600)
+    assert "chapter_partial_1" not in wf.vs.extra
+
+
+def test_scene_failure_discard_clears_partial_and_stops():
+    """场景失败弹窗提供「丢弃全部已生成内容」：选后清空断点并停止"""
+    seen_opts = []
+    def confirm(msg, opts):
+        seen_opts.append([o["action"] for o in opts])
+        return "discard"
+    wf = make_wf(["场景一正文。" * 100, RuntimeError("API返回空内容")], confirm=confirm)
+    with pytest.raises(ChapterPaused, match="已放弃"):
+        wf.generate_chapter(1, "初入都市", max_tokens=16000, target_words=600, beats=BEATS3)
+    assert "discard" in seen_opts[0]
+    assert "chapter_partial_1" not in wf.vs.extra  # 全部已生成内容被丢弃

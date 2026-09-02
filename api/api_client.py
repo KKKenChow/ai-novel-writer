@@ -22,7 +22,8 @@ class LLMAPIClient:
     }
 
     def __init__(self, api_key=None, api_base=None, model="doubao-pro-32k", timeout=180, max_retries=2,
-                 max_output=None, reasoning_effort=None, thinking_disabled=False):
+                 max_output=None, reasoning_effort=None, thinking_disabled=False, reasoning=False,
+                 thinking_disable_supported=False):
         self.api_key = api_key
         self.api_base = api_base or "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
         self.model = model
@@ -35,6 +36,10 @@ class LLMAPIClient:
         self.reasoning_effort = reasoning_effort or None
         # 关闭思考模式（DeepSeek/豆包格式 thinking.type=disabled）；仅用户显式开启时注入
         self.thinking_disabled = bool(thinking_disabled)
+        # 是否为推理模型（来自 provider 配置探测结果）；用于思考感知的预算放大
+        self.is_reasoning = bool(reasoning)
+        # 服务商是否真正支持关闭思考（探测结果；接受参数但忽略的部分网关会在运行时翻转为 False）
+        self.thinking_disable_supported = bool(thinking_disable_supported)
         # 取消检查回调：fn() -> bool，返回 True 表示任务已被用户取消；由外部注入
         self.cancel_check = None
         # 当前进行中的 HTTP 响应（供 cancel() 强断阻塞中的连接）
@@ -60,6 +65,13 @@ class LLMAPIClient:
             data["reasoning_effort"] = self.reasoning_effort
         if self.thinking_disabled:
             data["thinking"] = {"type": "disabled"}
+
+    @staticmethod
+    def _reasoning_text(msg: Dict) -> str:
+        """兼容两种思考字段名：reasoning_content（DeepSeek/豆包系）与 reasoning（部分网关/模型如 hy3）"""
+        if not isinstance(msg, dict):
+            return ""
+        return msg.get("reasoning_content") or msg.get("reasoning") or ""
 
     def cancel(self):
         """外部请求取消：强断当前阻塞中的 HTTP 连接，使正在进行的请求立即抛错返回"""
@@ -130,6 +142,7 @@ class LLMAPIClient:
                     f"temperature={temperature}, max_tokens={max_tokens}")
         
         last_error = None
+        retried_bigger = False  # 空正文(思考吃光预算)时只自动放大 max_tokens 重试一次
         for attempt in range(self.max_retries + 1):
             try:
                 self._check_cancelled()
@@ -143,10 +156,11 @@ class LLMAPIClient:
                     self.last_finish_reason = choice.get("finish_reason")
                     content = choice.get("message", {}).get("content") or ""
                     usage = result.get("usage", {})
-                    reasoning_len = len(choice.get("message", {}).get("reasoning_content") or "")
+                    reasoning_len = len(self._reasoning_text(choice.get("message", {})))
                     reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
                     if self.thinking_disabled and (reasoning_len or reasoning_tokens):
                         self.thinking_disable_ignored = True
+                        self.thinking_disable_supported = False
                         logger.warning("已请求关闭思考，但响应仍包含思考内容——该服务商可能不支持 thinking 参数")
                     if self.last_finish_reason == "length":
                         logger.warning(f"输出达到 max_tokens={max_tokens} 上限被截断（finish_reason=length）")
@@ -155,6 +169,15 @@ class LLMAPIClient:
                         if self.last_finish_reason == "length" and reasoning_len:
                             hint = ("【可能原因】该模型为推理模型，思考(reasoning)耗尽了全部 max_tokens 额度，"
                                     "未输出正文。请到「模型配置 → 高级设置」调大对应步骤的 max_tokens，或调低思考强度。")
+                        # 兜底：思考把预算吃光导致空正文 → 自动放大 max_tokens 重试一次，给正文留出额度
+                        if (reasoning_len and self.last_finish_reason == "length"
+                                and not retried_bigger and max_tokens < self.MAX_TOKENS_LIMIT):
+                            retried_bigger = True
+                            bigger = min(int(max_tokens * 3), self.MAX_TOKENS_LIMIT)
+                            logger.warning(f"响应仅含思考、正文为空，自动放大 max_tokens {max_tokens}→{bigger} 重试一次")
+                            max_tokens = bigger
+                            data["max_tokens"] = bigger
+                            continue
                         raise Exception(f"API返回空内容{hint}: {str(result)[:300]}")
                     # 打印API响应摘要
                     logger.info(f"API响应 ← model={result.get('model', self.model)}, tokens={usage.get('total_tokens', '?')}"
@@ -265,7 +288,7 @@ class LLMAPIClient:
                 if choice0.get("finish_reason"):
                     self.last_finish_reason = choice0["finish_reason"]
                 delta = choice0.get("delta") or {}
-                rc = delta.get("reasoning_content") or ""
+                rc = self._reasoning_text(delta)
                 if rc:
                     reasoning_len += len(rc)
                     if reasoning_callback:
@@ -290,6 +313,7 @@ class LLMAPIClient:
         reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
         if self.thinking_disabled and (reasoning_len or reasoning_tokens):
             self.thinking_disable_ignored = True
+            self.thinking_disable_supported = False
             logger.warning("已请求关闭思考，但流式响应仍包含思考内容——该服务商可能不支持 thinking 参数")
         if self.last_finish_reason == "length":
             logger.warning(f"输出达到 max_tokens={max_tokens} 上限被截断（finish_reason=length）")
@@ -372,7 +396,7 @@ class LLMAPIClient:
             message = choice.get("message") or {}
             usage = result.get("usage") or {}
             details = usage.get("completion_tokens_details") or {}
-            if message.get("reasoning_content") or (details.get("reasoning_tokens") or 0) > 0:
+            if self._reasoning_text(message) or (details.get("reasoning_tokens") or 0) > 0:
                 caps["reasoning"] = True
         except Exception:
             return caps
@@ -386,12 +410,22 @@ class LLMAPIClient:
                 caps["reasoning_effort_options"] = ["low", "medium", "high"]
         except Exception:
             pass
-        # 探测是否支持关闭思考（thinking.type=disabled，DeepSeek/豆包系格式）
+        # 探测是否支持关闭思考（thinking.type=disabled，DeepSeek/豆包系格式）。
+        # 不仅要参数被接受（HTTP 200），还必须真的不再输出思考——部分网关接受但忽略该参数
         try:
             resp = requests.post(self.api_url, headers=headers,
                                  json={**base, "thinking": {"type": "disabled"}}, timeout=timeout)
             if resp.status_code == 200:
                 caps["thinking_disable"] = True
+                try:
+                    res = resp.json()
+                    choice = (res.get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    details = (res.get("usage") or {}).get("completion_tokens_details") or {}
+                    if self._reasoning_text(msg) or (details.get("reasoning_tokens") or 0) > 0:
+                        caps["thinking_disable"] = False
+                except Exception:
+                    pass
         except Exception:
             pass
         return caps
