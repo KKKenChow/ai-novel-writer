@@ -22,6 +22,7 @@ class FakeVS:
             self.extra.pop(k, None)
         else:
             self.extra[k] = v
+    def delete_extra_field(self, k): self.extra.pop(k, None)
     def load_extra_data(self, k=None, default=None):
         return self.extra.get(k, default) if k else self.extra
 

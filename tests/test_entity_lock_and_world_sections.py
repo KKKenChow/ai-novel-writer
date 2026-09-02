@@ -19,6 +19,7 @@ class FakeVS:
     def search_related(self, q, n_results=5): return []
     def get_all_by_type(self, t): return []
     def save_extra_data(self, k, v): self.extra[k] = v
+    def delete_extra_field(self, k): self.extra.pop(k, None)
     def load_extra_data(self, k=None, default=None):
         return self.extra.get(k, default) if k else self.extra
 
@@ -217,6 +218,45 @@ def test_chapter_summaries_get_update_split():
     wf.novel_info["outline"] = "只有卷级"
     new2 = wf.update_chapter_summaries("第 1 章：一 —— 概要")
     assert "## 逐章概要" in new2 and "第 1 章：一 —— 概要" in new2
+
+
+def test_dedup_duplicate_volume_blocks():
+    """逐章概要段同卷重复块清理：优先保留与 volume_plan 卷名精确一致的块，否则保留最后一块"""
+    outline = ("故事主线：x\n\n---\n\n## 逐章概要\n"
+               "### 第一卷：彩虹骑士的诞生\n第 1 章：小镇的告别 —— 修摩托\n\n"
+               "### **第一卷：彩虹骑士的诞生（第1-40章）**\n**第 1 章：小镇的黄昏** —— 送外卖\n\n"
+               "---\n**本卷总结：** 主角完成蜕变\n")
+    plan = [{"name": "第一卷：彩虹骑士的诞生", "start": 1, "end": 40}]
+    fixed, removed = FullNovelWorkflow.deduplicate_summary_blocks(outline, plan)
+    assert removed == 1
+    assert fixed.startswith("故事主线：x")
+    assert "## 逐章概要" in fixed
+    assert "修摩托" in fixed and "送外卖" not in fixed
+    assert "本卷总结" not in fixed              # 被删块的尾部附注一并移除
+    assert fixed.count("###") == 1
+    # 无 plan 时保留最后一块
+    fixed2, removed2 = FullNovelWorkflow.deduplicate_summary_blocks(outline, None)
+    assert removed2 == 1 and "送外卖" in fixed2 and "修摩托" not in fixed2
+    # 无重复时原样返回
+    clean, removed3 = FullNovelWorkflow.deduplicate_summary_blocks(outline.replace("### **第一卷", "### 第二卷").replace("（第1-40章）", ""), plan)
+    assert removed3 == 0 and clean == outline.replace("### **第一卷", "### 第二卷").replace("（第1-40章）", "")
+
+
+def test_upsert_volume_detail_matches_by_volnum_and_dedups():
+    """卷概要写入：按卷号命中带加粗/范围后缀的旧块并替换，顺带清理同卷重复块"""
+    wf = make_wf()
+    outline = ("故事主线：x\n\n---\n\n## 逐章概要\n"
+               "### 第一卷：彩虹骑士的诞生\n第 1 章：旧一 —— 旧概要\n\n"
+               "### **第一卷：彩虹骑士的诞生（第1-40章）**\n第 1 章：旧二 —— 旧概要2\n\n"
+               "### 第二卷\n第 41 章：乙 —— 概要\n")
+    new = wf._upsert_volume_detail(outline, "第一卷：彩虹骑士的诞生", "第 1 章：新一 —— 新概要")
+    assert new.startswith("故事主线：x")
+    assert new.count("###") == 2                       # 第一卷重复块已清理，第二卷保留
+    assert "新概要" in new and "旧概要" not in new
+    assert "第 41 章：乙" in new
+    # 无同卷块时追加到段末
+    new2 = wf._upsert_volume_detail(outline, "第三卷：终局", "第 81 章：丙 —— 概要")
+    assert "### 第三卷：终局\n第 81 章：丙 —— 概要" in new2
 
 
 # ---------- 局部改写：角色卡注入 + 格式归一化 ----------

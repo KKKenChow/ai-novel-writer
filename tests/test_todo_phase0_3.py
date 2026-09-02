@@ -24,6 +24,7 @@ class FakeVS:
     def search_related(self, q, n_results=5): return []
     def get_all_by_type(self, t): return []
     def save_extra_data(self, k, v): self.extra[k] = v
+    def delete_extra_field(self, k): self.extra.pop(k, None)
     def load_extra_data(self, k=None, default=None):
         return self.extra.get(k, default) if k else self.extra
 

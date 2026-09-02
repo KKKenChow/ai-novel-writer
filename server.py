@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import asyncio
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -51,6 +52,10 @@ DEFAULT_MAX_TOKENS = {
     "extend_outline": 8000, "volume_chapters": 8000, "rewrite_outline": 6000,
     "migrate_cards": 6000, "memory_rebuild": 4000, "rewrite_preview": 2000,
 }
+
+# 评审快照内容指纹（CRC32，与前端 web/app.js 的 crc32 实现一致，用于判断评审是否过期）
+def _content_hash(text: str) -> str:
+    return format(zlib.crc32(text.encode("utf-8")), "08x")
 
 # ---------- API 客户端缓存（按激活配置） ----------
 
@@ -127,6 +132,15 @@ def _sync_novel_info(workflow: FullNovelWorkflow, store):
         if sanitized != vp:
             store.save_extra_data("volume_plan", sanitized)
             workflow.novel_info["volume_plan"] = sanitized
+    # 逐章概要段同卷重复块清理：同一卷多份概要只保留一份（优先匹配卷名，否则保留最后一份），
+    # 与 _upsert_volume_detail 的按卷号替换配合，杜绝节拍/章节读到互相矛盾的概要
+    outline = data.get("outline", "")
+    if outline:
+        repaired, removed = FullNovelWorkflow.deduplicate_summary_blocks(outline, sanitized if vp else None)
+        if removed:
+            logger.warning(f"逐章概要段发现 {removed} 个重复卷块，已自动清理")
+            store.add_section("outline", "full_outline", repaired)
+            workflow.novel_info["outline"] = repaired
 
 
 def get_store_workflow(novel_id: str) -> FullNovelWorkflow:
@@ -301,8 +315,13 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
                 target_words=target_words, beats=params.get("beats", ""))
             if is_ai_refusal(golden["content"]):
                 raise ValueError("AI拒绝了本次生成请求，请修改内容后重试（可能触发了内容安全审查）")
-            vs.save_extra_data(f"chapter_review_{chapter_num}", golden["review"])
-            vs.save_extra_data(f"chapter_golden_{chapter_num}", golden)
+            vs.save_extra_data(f"chapter_review_{chapter_num}", {
+                "review": golden["review"], "hash": _content_hash(golden["content"])})
+            vs.save_extra_data(f"chapter_golden_{chapter_num}", {
+                **golden,
+                "hash": _content_hash(golden["content"]),
+                "alt_hash": _content_hash(golden["alt_content"]),
+            })
             s1, s2 = golden["scores"]
             warning = (f"🏆 黄金开篇择优：版本A {s1}分 / 版本B {s2}分，"
                        f"已选版本{'AB'[golden['picked'] - 1]}。另一版可在章节下方对比查看。")
@@ -343,7 +362,8 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             if not content.strip():
                 raise ValueError("没有可评审的章节内容")
             review = workflow.review_chapter(chapter_num, params.get("chapter_title", ""), content, max_tokens=mt)
-            vs.save_extra_data(f"chapter_review_{chapter_num}", review)
+            vs.save_extra_data(f"chapter_review_{chapter_num}", {
+                "review": review, "hash": _content_hash(content)})
             result_payload["review"] = review
 
         elif step == "extend_outline":
@@ -381,10 +401,11 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             result_payload["preview"] = preview
 
         elif step == "memory_rebuild":
-            # TODO 1.1：手动重建台账与摘要；regen=true 逐章重调 LLM（有 token 成本，UI 已明示）
-            from_chapter = int(params.get("from_chapter", 1))
+            # 同步账本：regen=true 只重算缺失记录的章（all=true 全量重算，一般不需要）；
+            # 无缺失时前端走 /memory/rebuild 免费路径，不经过任务队列
             regen = bool(params.get("regen", False))
-            result_payload["rebuild"] = workflow.rebuild_memory(from_chapter, regen=regen, max_tokens=mt)
+            all_chapters = bool(params.get("all", False))
+            result_payload["rebuild"] = workflow.sync_memory(regen=regen, all_chapters=all_chapters, max_tokens=mt)
 
         elif step == "rewrite_preview":
             # TODO 4.2：单章"AI 改写建议预览"（不改正文，用户确认后再走 chapter 重写）
@@ -411,6 +432,9 @@ def _run_generation(task_id: str, novel_id: str, step: str, params: dict):
             workflow.novel_info.setdefault("chapters", {})[str(chapter_num)] = {
                 "title": chapter_title, "content": revised}
             workflow.invalidate_memory_from(chapter_num)
+            # 评审使命已完成且正文已变 → 清理旧评审与黄金开篇数据
+            vs.delete_extra_field(f"chapter_review_{chapter_num}")
+            vs.delete_extra_field(f"chapter_golden_{chapter_num}")
 
         elif step == "style_fingerprint":
             fp = workflow.extract_style_fingerprint(
@@ -830,6 +854,8 @@ def get_novel(novel_id: str):
     outline = data.get("outline") or ""
     if outline:
         fixed = re.sub(r'(第\s*[一二三四五六七八九十两\d]+\s*卷\s*[：:])\s*第\s*[一二三四五六七八九十两\d]+\s*卷\s*[：:]', r'\1', outline)
+        # 逐章概要段同卷重复块清理（保留规则见 deduplicate_summary_blocks）
+        fixed, _removed = FullNovelWorkflow.deduplicate_summary_blocks(fixed, sanitized if vp else None)
         if fixed != outline:
             store.add_section("outline", "full_outline", fixed)
             data["outline"] = fixed
@@ -880,7 +906,15 @@ def put_section(novel_id: str, sec: SectionIn):
 
 @app.delete("/api/novels/{novel_id}/section")
 def delete_section(novel_id: str, type: str, title: str):
-    get_store(novel_id).delete_section(type, title)
+    store = get_store(novel_id)
+    store.delete_section(type, title)
+    # 删除章节 → 连带清理该章的评审/黄金开篇孤儿数据
+    if type == "chapter":
+        m = re.match(r"chapter_(\d+)", title)
+        if m:
+            num = m.group(1)
+            store.delete_extra_field(f"chapter_review_{num}")
+            store.delete_extra_field(f"chapter_golden_{num}")
     return {"ok": True}
 
 
@@ -932,6 +966,9 @@ def import_chapter(novel_id: str, body: dict):
     result = wf.import_chapter(chapter_num, title, content)
     store = get_store(novel_id)
     result["ledger_stale"] = bool(store.load_extra_data("ledger_stale", False))
+    # 导入覆盖章节正文 → 旧评审针对旧正文，连带失效
+    store.delete_extra_field(f"chapter_review_{chapter_num}")
+    store.delete_extra_field(f"chapter_golden_{chapter_num}")
     return result
 
 
@@ -950,7 +987,7 @@ def create_blank_chapter(novel_id: str, body: dict):
 
 @app.get("/api/novels/{novel_id}/memory/status")
 def memory_status(novel_id: str):
-    """台账/摘要状态：stale 标记、delta 覆盖范围、伏笔回收统计、人工修正层"""
+    """台账/摘要状态：过期标记、缺失章、伏笔回收统计、人工修正层（免费计算，不调 AI）"""
     store = get_store(novel_id)
     deltas = store.load_extra_data("ledger_deltas", {}) or {}
     ledger = store.load_extra_data("state_ledger", {}) or {}
@@ -958,10 +995,18 @@ def memory_status(novel_id: str):
     has_ledger = any(ledger.get(k) for k in ("characters", "timeline", "foreshadowing"))
     fs = [f for f in ledger.get("foreshadowing", []) if isinstance(f, dict)]
     now = max([int(k) for k in deltas], default=0)
+    # 缺失章 = 有正文但无按章账页的章（账本过期/从未记录），供「同步账本」免费探测
+    chapters = store.load_all_to_dict()["chapters"]
+    missing = sorted(int(k) for k in chapters
+                     if str(k).isdigit() and (chapters[k].get("content") or "").strip()
+                     and str(k) not in deltas)
     return {
         "ledger_stale": bool(store.load_extra_data("ledger_stale", False)),
         "ledger_stale_from": store.load_extra_data("ledger_stale_from", None),
         "delta_chapters": sorted(int(k) for k in deltas),
+        "covered_upto": now,
+        "missing_chapters": missing,
+        "est_calls": len(missing),
         "has_ledger": has_ledger,
         "has_summary": bool(store.load_extra_data("rolling_summary", "")
                             or store.load_extra_data("rolling_summary_recent", "")),
@@ -974,6 +1019,14 @@ def memory_status(novel_id: str):
         },
         "manual_fixes": bool(store.load_extra_data("ledger_manual_fixes", {})),
     }
+
+
+@app.post("/api/novels/{novel_id}/memory/rebuild")
+def memory_rebuild(novel_id: str, body: dict = None):
+    """同步账本（零成本路径）：只用已有按章记录重算合并态/摘要，不调用 AI。
+    有缺失章的同步请走 /api/generate step=memory_rebuild（regen=true）。"""
+    wf = get_store_workflow(novel_id)
+    return wf.sync_memory(regen=False)
 
 
 class MemoryFixIn(BaseModel):

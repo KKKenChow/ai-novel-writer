@@ -114,8 +114,22 @@ label.field { display: block; margin: 10px 0 4px; color: var(--fg-dim); font-siz
 .caption { color: var(--fg-dim); font-size: 12px; margin: 4px 0; }
 .box { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin: 12px 0; }
 .box h4 { margin: 0 0 8px; }
+.box.collapsible > summary { cursor: pointer; font-weight: 600; color: var(--fg); padding: 2px 0; user-select: none; }
+.box.collapsible[open] > summary { margin-bottom: 10px; }
 .divider { border-top: 1px solid var(--border); margin: 16px 0; }
 .hidden { display: none !important; }
+
+/* 「?」问号键：点击展开/收起的通俗说明（按钮与区块旁） */
+.help-wrap { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle; }
+button.btn.help-btn {
+  width: 20px; height: 20px; padding: 0; border-radius: 50%;
+  font-size: 12px; line-height: 1; flex: 0 0 auto;
+}
+.help-body {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-size: 12px; color: var(--fg-dim); line-height: 1.8;
+  max-width: 560px; white-space: pre-wrap;
+}
 
 .msg { padding: 10px 14px; border-radius: 8px; margin: 8px 0; font-size: 13px; white-space: pre-wrap; }
 /* 全局提示浮层：固定在顶部居中，层级高于所有遮罩/弹窗（生成遮罩1000、确认弹窗9999），

@@ -25,6 +25,7 @@ class FakeVS:
     def search_related(self, q, n_results=5): return []
     def get_all_by_type(self, t): return []
     def save_extra_data(self, k, v): self.extra[k] = v
+    def delete_extra_field(self, k): self.extra.pop(k, None)
     def load_extra_data(self, k=None, default=None):
         return self.extra.get(k, default) if k else self.extra
 
@@ -74,18 +75,45 @@ def test_ledger_delta_undo_on_regenerate():
     assert wf.vs.extra["ledger_stale"] is True  # 第 3 章还在但 delta 没了 → stale
 
 
-def test_rebuild_memory_regen():
-    """rebuild_memory(regen=True) 逐章重算 delta 并清除 stale"""
+def test_sync_memory_probe_no_api():
+    """sync_memory()（regen=False）零成本：不调 API，只报告缺失章"""
     wf = make_wf()
     for n in (1, 2, 3):
         wf.novel_info.setdefault("chapters", {})[str(n)] = {"title": f"章{n}", "content": f"第{n}章正文"}
         wf.update_state_ledger(n, f"第{n}章正文内容")
     wf.invalidate_memory_from(2)
-    result = wf.rebuild_memory(from_chapter=2, regen=True)
-    assert result["regenerated"] == 2  # 第 2、3 章重算
+    calls_before = len(wf.api.prompts)
+    result = wf.sync_memory(regen=False)
+    assert len(wf.api.prompts) == calls_before  # 探测/免费合并不调 AI
+    assert result["regenerated"] == 0
+    assert result["missing"] == [2, 3]
+
+
+def test_sync_memory_regen_only_missing():
+    """sync_memory(regen=True) 只重算缺失章的 delta 并清除 stale"""
+    wf = make_wf()
+    for n in (1, 2, 3):
+        wf.novel_info.setdefault("chapters", {})[str(n)] = {"title": f"章{n}", "content": f"第{n}章正文"}
+        wf.update_state_ledger(n, f"第{n}章正文内容")
+    wf.invalidate_memory_from(2)
+    result = wf.sync_memory(regen=True)
+    assert result["regenerated"] == 2  # 只重算缺失的第 2、3 章，不重算第 1 章
+    assert result["missing"] == []
     assert wf.vs.extra["ledger_stale"] is False
     items = [f["item"] for f in result["ledger"]["foreshadowing"]]
     assert set(items) == {"伏笔1号", "伏笔2号", "伏笔3号"}
+
+
+def test_sync_memory_all_chapters():
+    """sync_memory(regen=True, all_chapters=True) 从第 1 章全量重算"""
+    wf = make_wf()
+    for n in (1, 2, 3):
+        wf.novel_info.setdefault("chapters", {})[str(n)] = {"title": f"章{n}", "content": f"第{n}章正文"}
+        wf.update_state_ledger(n, f"第{n}章正文内容")
+    wf.invalidate_memory_from(2)
+    result = wf.sync_memory(regen=True, all_chapters=True)
+    assert result["regenerated"] == 3  # 第 1 章也被重算
+    assert result["missing"] == []
 
 
 def test_rolling_summary_snapshot_rebuild():

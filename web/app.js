@@ -28,6 +28,46 @@ const el = (tag, cls, text) => {
 };
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+// 可折叠区块：details.box 包裹，默认收起（不带 open 属性即为收起态）
+function collapsibleBox(titleHtml, { open = false } = {}) {
+  const d = el("details", "box collapsible");
+  if (open) d.open = true;
+  const s = el("summary");
+  s.innerHTML = titleHtml;
+  d.append(s);
+  return d;
+}
+
+// 「?」问号键：点击展开/收起一段通俗说明（用于按钮与区块旁）
+function helpBtn(text) {
+  const wrap = el("span", "help-wrap");
+  const b = el("button", "btn help-btn", "?");
+  b.type = "button";
+  b.setAttribute("aria-label", "查看说明");
+  const body = el("div", "help-body hidden", text);
+  b.onclick = () => body.classList.toggle("hidden");
+  wrap.append(b, body);
+  return wrap;
+}
+
+// CRC32（与后端 zlib.crc32 一致，用于评审快照指纹比对）
+const CRC32_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[i] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(str) {
+  const bytes = new TextEncoder().encode(str);
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC32_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function contentHash(text) { return crc32(text).toString(16).padStart(8, "0"); }
+
 async function api(path, opts = {}) {
   if (opts.body && typeof opts.body !== "string") {
     opts.body = JSON.stringify(opts.body);
@@ -57,7 +97,7 @@ const STEP_NAMES = {
   style_fingerprint: "文风指纹", humanize: "去AI腔", batch_chapters: "批量生成",
   consistency: "一致性检查", relation_graph: "角色图谱", distill: "技能蒸馏",
   extend_outline: "扩展大纲", volume_chapters: "逐章概要", rewrite_outline: "局部改写大纲",
-  migrate_cards: "迁移角色卡", memory_rebuild: "重建台账", rewrite_preview: "改写建议预览",
+  migrate_cards: "迁移角色卡", memory_rebuild: "同步账本", rewrite_preview: "改写建议预览",
   validate_beats: "校验节拍",
 };
 
@@ -653,15 +693,34 @@ function genBlock({ label, placeholder, promptValue = "", btnText, step, extraFi
 }
 
 /* 可编辑内容视图：显示 + 编辑自动保存 + 清除 + 原始对比 */
-function editableContent({ title, content, type, sectionTitle, originalKey, promptKey, onCleared }) {
-  const wrap = el("div", "box");
+/* 大纲文本切分：卷级部分（「## 逐章概要」标记之前）与逐章概要段（含标记本身）。
+   逐章概要在「大纲扩展操作」区独立编辑，主编辑区只显示卷级部分。 */
+const OUTLINE_SUMMARY_MARKERS = ["## 逐章概要", "## 逐章大纲"];
+function splitOutlineSummary(outline) {
+  let idx = -1;
+  for (const m of OUTLINE_SUMMARY_MARKERS) {
+    const i = outline.indexOf(m);
+    if (i >= 0 && (idx < 0 || i < idx)) idx = i;
+  }
+  if (idx < 0) return { base: outline, summaries: "" };
+  return { base: outline.slice(0, idx).replace(/(?:\n---)+\s*$/, "").trimEnd(), summaries: outline.slice(idx) };
+}
+function mergeOutlineSummary(base, summaries) {
+  const b = base.replace(/(?:\n---)+\s*$/, "").trimEnd();
+  if (!summaries.trim()) return b;
+  return b + `\n\n---\n\n${summaries.trimStart()}`;
+}
+
+function editableContent({ title, content, type, sectionTitle, originalKey, promptKey, onCleared, onSave, collapsible = false, defaultOpen = false }) {
+  const wrap = collapsible ? collapsibleBox(esc(title), { open: defaultOpen }) : el("div", "box");
   const ta = el("textarea"); ta.rows = 14; ta.value = content;
   const status = el("div", "caption", "编辑后自动保存");
   let timer = null;
+  const saver = onSave || ((v) => saveSection(type, sectionTitle, v));
   ta.oninput = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
-      await saveSection(type, sectionTitle, ta.value);
+      await saver(ta.value);
       status.textContent = "✅ 已自动保存 " + new Date().toLocaleTimeString();
     }, 800);
   };
@@ -950,11 +1009,21 @@ function tabOutline(root) {
     },
   }));
   if (S.novel.outline) {
+    const { base, summaries } = splitOutlineSummary(S.novel.outline);
     root.append(editableContent({
-      title: "小说大纲", content: S.novel.outline,
+      title: "小说大纲", content: base,
       type: "outline", sectionTitle: "full_outline",
       originalKey: "outline_original", promptKey: "outline_prompt",
+      collapsible: true,
+      onSave: async (content) => {
+        const cur = splitOutlineSummary(S.novel.outline || "");
+        const full = mergeOutlineSummary(content, cur.summaries);
+        const r = await saveSection("outline", "full_outline", full);
+        S.novel.outline = full;
+        return r;
+      },
     }));
+    root.insertAdjacentHTML("beforeend", `<div class="caption">💡 此处仅编辑卷级大纲；逐章概要在下方「大纲扩展操作」区独立编辑。</div>`);
   }
   // TODO 3.1 / 3.2 / 3.3 / 4.1：大纲扩展操作区
   renderOutlineExtra(root);
@@ -1009,7 +1078,7 @@ function renderOutlineExtra(root) {
     box.append(volWrap);
   }
 
-  // TODO 3.3：插入卷标题（读取当前大纲末尾追加，不写 editableContent 内部）
+  // TODO 3.3：插入卷标题（追加到卷级部分末尾、逐章概要之前，不写 editableContent 内部）
   const vtBtn = el("button", "btn small", "🏷️ 插入卷标题");
   vtBtn.style.marginTop = "10px";
   vtBtn.onclick = async () => {
@@ -1018,9 +1087,11 @@ function renderOutlineExtra(root) {
     const outline = S.novel.outline || "";
     let maxV = 0;
     for (const m of outline.matchAll(/### 第(\d+)卷/g)) maxV = Math.max(maxV, +m[1]);
-    const text = outline + `\n\n### 第${maxV + 1}卷 ${name.trim()}\n`;
+    const { base, summaries } = splitOutlineSummary(outline);
+    const base2 = base.trimEnd() + `\n\n### 第${maxV + 1}卷 ${name.trim()}\n`;
+    const text = mergeOutlineSummary(base2, summaries);
     await saveSection("outline", "full_outline", text);
-    alertMsg("success", `已在末尾插入「### 第${maxV + 1}卷 ${name.trim()}」`);
+    alertMsg("success", `已在卷级大纲末尾插入「### 第${maxV + 1}卷 ${name.trim()}」`);
     refreshNovel(true);
   };
   box.append(vtBtn);
@@ -1046,13 +1117,13 @@ function renderOutlineExtra(root) {
 
   // TODO 3.2b：逐章概要独立编辑（数据仍存于大纲「## 逐章概要」之后，卷级部分不动）
   if (S.novel.outline) {
-    const sumWrap = el("div");
-    sumWrap.innerHTML = `<label class="field" style="margin-top:10px">📝 编辑逐章概要</label>
-      <div class="caption">独立编辑大纲中的逐章概要段（「## 逐章概要」之后全部内容），卷级大纲不受影响；保存后与「小说大纲」编辑区同步。逐章概要生成时会按角色卡标注的登场章安排角色出场。</div>`;
+    const sumWrap = collapsibleBox("📝 编辑逐章概要");
+    const sumHint = el("div", "caption",
+      "独立编辑大纲中的逐章概要段（「## 逐章概要」之后全部内容），卷级大纲不受影响；保存后与「小说大纲」编辑区同步。逐章概要生成时会按角色卡标注的登场章安排角色出场。");
     const sumTa = el("textarea"); sumTa.rows = 10;
     sumTa.style.width = "100%";
     const sumStatus = el("div", "caption", "加载中…");
-    sumWrap.append(sumTa, sumStatus);
+    sumWrap.append(sumHint, sumTa, sumStatus);
     let sumTimer = null;
     sumTa.oninput = () => {
       clearTimeout(sumTimer);
@@ -1091,8 +1162,7 @@ function tabChapter(root) {
 
 /* 新增章节区：AI 生成 / 空白章节 / 导入章节 三种方式平级切换 */
 function renderChapterAdder(root) {
-  const box = el("div", "box");
-  box.innerHTML = `<h4>➕ 新增章节</h4>`;
+  const box = collapsibleBox("➕ 新增章节");
   const tabsRow = el("div", "row");
   const modes = [["generate", "✍️ AI 生成"], ["blank", "➕ 空白章节"], ["import", "📥 导入章节"]];
   for (const [m, label] of modes) {
@@ -1530,53 +1600,64 @@ function renderMemoryPanel(root) {
   const summaryFull = extra("rolling_summary_full") || extra("rolling_summary");
   const summaryRecent = extra("rolling_summary_recent");
   const ms = S.memoryStatus;
-  // TODO 1.1：以 memory/status 为准判断是否渲染；status 不可用则回退旧逻辑
   if (ms && !ms.has_ledger && !ms.has_summary) return;
   if (!ms && !ledger && !summaryFull) return;
   const det = el("details", "box");
   det.open = true;
-  det.innerHTML = `<summary><b>🧠 长篇记忆（伏笔台账 / 滚动摘要）</b></summary>`;
+  det.innerHTML = `<summary><b>🧠 剧情账本（AI 自动记账）</b></summary>`;
+  det.querySelector("summary").appendChild(helpBtn(
+    "「剧情账本」是 AI 在每章写完后自动记的账：角色现在在哪、什么状态（位置/伤势/关系/实力）、发生过什么大事、埋了什么伏笔还没收。它和两份剧情摘要（全书梗概 + 近期摘要）一起，在写下一章时喂给 AI，保证长篇小说前后不矛盾。所有记录都存在本地文件里，你可以随时查看和修正。"));
 
-  // ---- C5 健康面板 ----
+  // ---- 状态行（人话） ----
   const deltas = (ms && ms.delta_chapters) || [];
   const fsw = (ms && ms.foreshadowing) || { total: 0, recovered: 0, overdue: 0 };
   const health = el("div", "caption");
   health.style.margin = "4px 0";
   let htext = [];
-  if (deltas.length) htext.push(`delta 覆盖第 ${deltas[0]}-${deltas[deltas.length - 1]} 章（${deltas.length} 章）`);
-  else if (ms && ms.has_ledger) htext.push("delta 记录为空（仅合并态）");
+  const upto = (ms && ms.covered_upto) || (deltas.length ? deltas[deltas.length - 1] : 0);
+  if (upto) htext.push(`账本已记到第 ${upto} 章`);
+  else if (ms && ms.has_ledger) htext.push("账本有内容但尚无按章记录");
   if (ms && ms.has_full_summary) htext.push("全书梗概 ✓");
   if (ms && ms.has_summary) htext.push("近期摘要 ✓");
-  if (fsw.total) htext.push(`伏笔回收 ${fsw.recovered}/${fsw.total}`);
+  if (fsw.total) htext.push(`待回收伏笔 ${fsw.total - fsw.recovered} · 已回收 ${fsw.recovered}`);
   if (fsw.overdue) htext.push(`⚠️ 逾期 ${fsw.overdue} 条`);
-  if (ms && ms.manual_fixes) htext.push("人工修正层 ✓");
-  health.textContent = htext.join(" · ") || "尚无记忆数据";
+  if (ms && ms.manual_fixes) htext.push("含人工修改");
+  health.textContent = htext.join(" · ") || "账本还是空的：生成章节后 AI 会自动开始记账";
   det.append(health);
-  // stale 提示
-  if (ms && ms.ledger_stale) {
+  // 过期提示（人话）
+  const missing = (ms && ms.missing_chapters) || [];
+  if (ms && ms.ledger_stale && missing.length) {
     const warn = el("div", "msg warn");
-    warn.textContent = `⚠️ 有章节被重生成/编辑/导入，第 ${ms.ledger_stale_from ?? 1} 章起的台账与摘要已标记待重建（下次生成章节前会自动补齐）。`;
+    warn.textContent = `⚠️ 第 ${missing[0]}~${missing[missing.length - 1]} 章的账本已过期（这些章节被重写/编辑过，旧账不可信）。下次生成章节前会自动补齐，也可以点下面的「同步账本」立即补齐。`;
     det.append(warn);
   }
 
-  // ---- 摘要展示（双通道） ----
+  // ---- 摘要展示（双通道，各带 ?） ----
   if (summaryFull) {
     const d1 = el("details");
-    d1.innerHTML = `<summary class="caption">📖 全书剧情梗概（长期记忆，不随篇幅丢失）</summary><div class="content-view">${esc(summaryFull)}</div>`;
+    d1.innerHTML = `<summary class="caption">📖 全书剧情梗概</summary><div class="content-view">${esc(summaryFull)}</div>`;
+    d1.querySelector("summary").appendChild(helpBtn(
+      "AI 对整本书主线的压缩版回顾（≤300字），重点保留早期设定和主角目标，防止写到后面忘了开头。每生成一章后自动更新，一般不需要手动操作。"));
     det.append(d1);
   }
   if (summaryRecent) {
     const d2 = el("details");
     d2.innerHTML = `<summary class="caption">📖 近期剧情摘要</summary><div class="content-view">${esc(summaryRecent)}</div>`;
+    d2.querySelector("summary").appendChild(helpBtn(
+      "AI 对最近约 10 章剧情的详细回顾（≤500字），保留事件细节与状态变化，让写下一章时能接上最近的剧情。每生成一章后自动更新。"));
     det.append(d2);
   }
 
-  // ---- C2 角色状态台账（可编辑，写入人工修正层） ----
+  // ---- 角色状态账本（可编辑，写入人工修正层） ----
   if (ledger && typeof ledger === "object") {
     const chars = Array.isArray(ledger.characters) ? ledger.characters : [];
     if (chars.length) {
       const chBox = el("div");
-      chBox.innerHTML = `<h4>👥 角色状态台账（编辑后写入人工修正层，AI 重建不会覆盖）</h4>`;
+      const chTitle = el("h4");
+      chTitle.innerHTML = "👥 角色状态账本";
+      chTitle.appendChild(helpBtn(
+        "AI 记录的每个角色的当前状态（位置/伤势/关系/实力等），按最后活跃章节排序。觉得哪条记错了，点「编辑」直接改——你改的内容写进「人工修正层」，之后无论 AI 怎么重建账本都不会覆盖你的修改。"));
+      chBox.appendChild(chTitle);
       for (const c of chars) {
         const row = el("div", "row");
         const upd = c.updated_chapter ? `（第${c.updated_chapter}章活跃）` : "";
@@ -1601,11 +1682,15 @@ function renderMemoryPanel(root) {
       det.append(chBox);
     }
 
-    // ---- 剧情时间线（只读） ----
+    // ---- 剧情大事记（只读） ----
     const tl = Array.isArray(ledger.timeline) ? ledger.timeline.slice(-12).reverse() : [];
     if (tl.length) {
       const tlBox = el("div");
-      tlBox.innerHTML = `<h4>🕐 剧情时间线（最近 12 条）</h4>`;
+      const tlTitle = el("h4");
+      tlTitle.innerHTML = "🕐 剧情大事记（最近 12 条）";
+      tlTitle.appendChild(helpBtn(
+        "AI 给每章提炼的一句话核心事件，按章号去重排列。只读展示，方便你快速回顾剧情走到哪了。"));
+      tlBox.appendChild(tlTitle);
       for (const t of tl) {
         const row = el("div", "caption");
         row.textContent = `第${t.chapter ?? "?"}章：${t.event || ""}`;
@@ -1614,7 +1699,7 @@ function renderMemoryPanel(root) {
       det.append(tlBox);
     }
 
-    // ---- C3 伏笔看板 ----
+    // ---- 伏笔看板 ----
     const fs = Array.isArray(ledger.foreshadowing) ? ledger.foreshadowing : [];
     if (fs.length) {
       const now = deltas.length ? deltas[deltas.length - 1] : 0;
@@ -1629,7 +1714,11 @@ function renderMemoryPanel(root) {
       };
       pending.sort((a, b) => sortKey(a) - sortKey(b));
       const fsBox = el("div");
-      fsBox.innerHTML = `<h4>🎣 伏笔看板（待回收 ${pending.length} · 已回收 ${recovered.length}${overdue.length ? ` · 逾期 ${overdue.length}` : ""}）</h4>`;
+      const fsTitle = el("h4");
+      fsTitle.innerHTML = `🎣 伏笔看板（待回收 ${pending.length} · 已回收 ${recovered.length}${overdue.length ? ` · 逾期 ${overdue.length}` : ""}）`;
+      fsTitle.appendChild(helpBtn(
+        "「伏笔」指先埋下、后面才兑现的线索。看板按紧急程度排序：目标章已过的「逾期」→ 5 章内的「临近」→ 远期。写作时 AI 会优先提醒待回收的伏笔。AI 有时会漏报「已回收」：当剧情里伏笔已经兑现，点「标记已回收」手动告诉系统——你的标记永久有效，不会被 AI 覆盖。"));
+      fsBox.appendChild(fsTitle);
       const mkRow = (f, markBtn) => {
         const row = el("div", "row");
         const label = el("span", "caption", `第${f.planted_chapter ?? "?"}章埋设${f.target_chapter ? ` → 目标第${f.target_chapter}章` : ""}：${esc(f.item)}`);
@@ -1661,50 +1750,67 @@ function renderMemoryPanel(root) {
     }
   }
 
-  // TODO 1.1：手动重建台账与摘要（合并态零成本 / 逐章重算 delta 有 token 成本）
-  const rb = el("div");
-  rb.innerHTML = `<h4>🔧 重建台账与摘要</h4>
-    <div class="row">
-      <div><label class="field">从第几章起</label><input type="number" id="rb-from" min="1" value="${(ms && ms.ledger_stale_from) || 1}" style="width:90px"></div>
-    </div>`;
-  const rbRow = el("div", "row");
-  const rbMerge = el("button", "btn small shrink", "🔧 仅重建合并态（零成本）");
-  rbMerge.onclick = () => {
-    const from_chapter = +rb.querySelector("#rb-from").value || 1;
-    runGeneration("memory_rebuild", { from_chapter, regen: false }, { onDone: () => refreshNovel(true) });
+  // ---- 操作区：同步账本 / 清空账本（两按钮，各带 ?） ----
+  const ops = el("div");
+  ops.style.marginTop = "8px";
+  const opsRow = el("div", "row");
+  const syncBtn = el("button", "btn small", "🔄 同步账本");
+  syncBtn.appendChild(helpBtn(
+    "把账本和正文对齐。账本由 AI 每章写完后自动更新，不用你管；但当某章被重写/编辑/导入后，基于旧版本记的账就不可信了，系统会标记「过期」。点「同步账本」让 AI 重新读取这些章的最新正文、把账补上。\n\n· 没有过期章节时：点击直接完成，不调用 AI（零成本）\n· 有过期章节时：先弹窗告诉你需要重读哪几章、约几次调用，确认后才执行"));
+  syncBtn.onclick = async () => {
+    const missingNow = (S.memoryStatus && S.memoryStatus.missing_chapters) || [];
+    if (!missingNow.length) {
+      try {
+        await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/rebuild`, { method: "POST", body: {} });
+        alertMsg("success", "账本与正文一致，已同步（未调用 AI）");
+        refreshNovel(true);
+      } catch (e) { alertMsg("error", `同步失败：${e.message}`); }
+      return;
+    }
+    const choice = await memorySyncDialog(missingNow);
+    if (!choice) return;
+    runGeneration("memory_rebuild", { regen: true, all: choice.all }, { onDone: () => refreshNovel(true) });
   };
-  const rbRegen = el("button", "btn small shrink", "🤖 逐章重算 delta（每章约1次API调用，有 token 成本）");
-  rbRegen.onclick = () => {
-    const from_chapter = +rb.querySelector("#rb-from").value || 1;
-    if (!confirm(`将从第 ${from_chapter} 章起逐章重算 delta，每章约 1 次 API 调用，会产生 token 成本。确定？`)) return;
-    runGeneration("memory_rebuild", { from_chapter, regen: true }, { onDone: () => refreshNovel(true) });
-  };
-  rbRow.append(rbMerge, rbRegen);
-  rb.append(rbRow);
-  det.append(rb);
-
-  // C4 清空按钮修正：清空展示（保留按章记录）/ 彻底清空（含按章记录）
-  const clearRow = el("div", "row");
-  clearRow.style.marginTop = "6px";
-  const clearSoft = el("button", "btn small", "🗑️ 清空展示（保留按章记录）");
-  clearSoft.onclick = async () => {
-    if (!confirm("只清空合并台账与当前摘要？按章记录（delta/摘要快照）会保留，下次生成章节时自动重建。")) return;
-    try {
-      await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/clear`, { method: "POST", body: { deep: false } });
-      refreshNovel(true);
-    } catch (e) { alertMsg("error", `清空失败：${e.message}`); }
-  };
-  const clearDeep = el("button", "btn small", "💀 彻底清空（含按章记录）");
-  clearDeep.onclick = async () => {
-    if (!confirm("彻底清空长篇记忆（含按章 delta/摘要快照/人工修正层）？后续章节将彻底失去长期一致性辅助，此操作不可逆。")) return;
+  const clearBtn = el("button", "btn small", "🗑 清空账本");
+  clearBtn.appendChild(helpBtn(
+    "把 AI 记的所有账（角色状态/大事记/伏笔/摘要）连同你在面板上的手动修改全部删除，小说正文不受影响。删除后 AI 会从下一章开始重新积累账本，但旧伏笔、旧状态不会再被提醒——连载中请谨慎。此操作不可恢复。"));
+  clearBtn.onclick = async () => {
+    if (!confirm("将删除 AI 记的所有账（角色状态/大事记/伏笔/摘要）以及你做过的手动修改。\n小说正文不受影响；删除后 AI 会从下一章开始重新积累，但旧伏笔、旧状态不会再被提醒。\n\n此操作不可恢复，确定清空？")) return;
+    if (!confirm("再次确认：确定彻底清空账本？")) return;
     try {
       await api(`/api/novels/${encodeURIComponent(S.novelId)}/memory/clear`, { method: "POST", body: { deep: true } });
+      alertMsg("success", "账本已清空");
       refreshNovel(true);
     } catch (e) { alertMsg("error", `清空失败：${e.message}`); }
   };
-  clearRow.append(clearSoft, clearDeep);
-  det.append(clearRow);
+  opsRow.append(syncBtn, clearBtn);
+  ops.append(opsRow);
+  det.append(ops);
   root.append(det);
+}
+
+// 「同步账本」确认弹窗：返回 {all: boolean}（all=true 表示从第1章全量重写）或 null（取消）
+function memorySyncDialog(missing) {
+  return new Promise((resolve) => {
+    const ov = el("div", "task-confirm-overlay");
+    const card = el("div", "task-confirm-card");
+    const first = missing[0], last = missing[missing.length - 1];
+    const msg = el("div", "task-confirm-msg");
+    msg.innerHTML = `第 <b>${first}~${last}</b> 章的账本已过期（这些章节被改写过，旧账不可信）。<br>将重新读取这些章的最新正文、让 AI 重写账本，共 <b>${missing.length}</b> 次 API 调用（有 token 成本）。<br><span class="caption">「全量重写」会连第 1 章起所有章节的账本一起重写（调用次数更多），一般只在怀疑早期账本也记错时使用。</span>`;
+    const row = el("div", "row");
+    row.style.marginTop = "14px";
+    const mk = (label, value, primary) => {
+      const b = el("button", primary ? "btn primary small" : "btn small", label);
+      b.onclick = () => { ov.remove(); resolve(value); };
+      row.appendChild(b);
+    };
+    mk("只重算过期章", { all: false }, true);
+    mk("全量重写（从第1章）", { all: true });
+    mk("取消", null);
+    card.append(msg, row);
+    ov.appendChild(card);
+    document.body.appendChild(ov);
+  });
 }
 
 function renderChapterEditor(root) {
@@ -1712,9 +1818,8 @@ function renderChapterEditor(root) {
   const key = chUI.activeKey;
   if (!key || !chapters[key]) return;
   const c = chapters[key];
-  const box = el("div", "box");
+  const box = collapsibleBox(`📖 第${key}章 ${esc(c.title)}（${(c.content || "").length} 字）`);
   box.id = "chapter-editor";
-  box.innerHTML = `<h4>📖 第${key}章 ${esc(c.title)}（${(c.content || "").length} 字）</h4>`;
   const ta = el("textarea"); ta.rows = 20; ta.value = c.content;
   const status = el("div", "caption", "编辑后自动保存");
   let timer = null;
@@ -1754,15 +1859,26 @@ function renderChapterEditor(root) {
   ops.append(reviewBtn, reviseBtn, rewriteBtn, delBtn);
   box.append(ta, status, ops);
 
-  const review = extra(`chapter_review_${key}`);
-  if (review) {
+  // 评审结果（新结构 {review, hash} 带正文快照指纹；旧数据为纯字符串，兼容显示）
+  const reviewData = extra(`chapter_review_${key}`);
+  const reviewText = typeof reviewData === "string" ? reviewData : (reviewData?.review || "");
+  const reviewStale = reviewData && typeof reviewData === "object"
+    && typeof reviewData.hash === "string" && contentHash(ta.value) !== reviewData.hash;
+  if (reviewText) {
     const rBox = el("div", "box");
-    rBox.innerHTML = `<h4>📝 评审结果</h4><div class="content-view">${esc(review)}</div>`;
+    rBox.innerHTML = `<h4>📝 评审结果</h4>
+      ${reviewStale ? `<div class="caption" style="color:#b45309">⚠️ 评审基于旧版本正文（当前正文已修改），意见可能不适用，请重新评审。</div>` : ""}
+      <div class="content-view">${esc(reviewText)}</div>`;
     box.append(rBox);
-    reviseBtn.onclick = () => {
-      if (!confirm("将按评审意见改写本章并覆盖原内容，确定？")) return;
-      runGeneration("chapter_revise", { chapter_num: +key, chapter_title: c.title, content: ta.value, review });
-    };
+    if (reviewStale) {
+      reviseBtn.disabled = true;
+      reviseBtn.title = "评审已过期（正文已修改），请重新评审后再改写";
+    } else {
+      reviseBtn.onclick = () => {
+        if (!confirm("将按评审意见改写本章并覆盖原内容，确定？")) return;
+        runGeneration("chapter_revise", { chapter_num: +key, chapter_title: c.title, content: ta.value, review: reviewText });
+      };
+    }
   } else {
     reviseBtn.disabled = true;
     reviseBtn.title = "请先评审";
@@ -1771,8 +1887,10 @@ function renderChapterEditor(root) {
   // 黄金开篇落选版本对比
   const golden = extra(`chapter_golden_${key}`);
   if (golden && golden.alt_content) {
+    const goldenStale = typeof golden.hash === "string" && contentHash(ta.value) !== golden.hash;
     const det = el("details", "box");
     det.innerHTML = `<summary><b>🏆 黄金开篇：落选版本对比</b>（得分 ${esc(String(golden.scores?.[0]))} / ${esc(String(golden.scores?.[1]))}）</summary>
+      ${goldenStale ? `<div class="caption" style="color:#b45309">⚠️ 当前正文与获选版本不一致（已被编辑或换用），评审分数仅供参考。</div>` : ""}
       <h4>落选版本正文</h4><div class="content-view">${esc(golden.alt_content)}</div>
       <h4>落选版本评审</h4><div class="content-view">${esc(golden.alt_review || "")}</div>`;
     const swap = el("button", "btn small", "🔄 换用落选版本");

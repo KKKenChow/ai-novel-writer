@@ -370,7 +370,7 @@ class FullNovelWorkflow:
 
         - 同章节号覆盖（UI 层负责冲突确认）；
         - 入库后从该章起做记忆失效处理（旧 delta 撤销，后续章 delta 标记 stale），
-          调用方可视情况再调 rebuild_memory(regen=True) 逐章补齐。
+          调用方可视情况再调 sync_memory(regen=True) 只重算缺失章补齐。
         """
         title = (title or "").strip() or f"第{chapter_num}章"
         content = (content or "").strip()
@@ -642,7 +642,8 @@ class FullNovelWorkflow:
         marker = self._find_volume_chapter_marker(outline)
         return outline[:marker].rstrip() if marker >= 0 else outline
 
-    def _find_volume_chapter_marker(self, outline: str) -> int:
+    @staticmethod
+    def _find_volume_chapter_marker(outline: str) -> int:
         """返回大纲中「逐章概要」小节标记的起始下标；兼容旧数据里的「逐章大纲」标记。
 
         返回 -1 表示大纲中尚无该小节。
@@ -744,15 +745,20 @@ class FullNovelWorkflow:
         return vol_result
 
     def _upsert_volume_detail(self, outline: str, vol_name: str, new_text: str) -> str:
-        """把卷逐章概要写入大纲：若已存在同卷的「### 卷名」小节则整体替换，否则在末尾追加。
-        返回更新后的大纲全文。
+        """把卷逐章概要写入大纲：按卷号在「逐章概要」段内定位同卷块（块头带加粗/范围后缀也能命中），
+        整体替换并顺带删除同卷其他重复块；找不到则追加到段末。返回更新后的大纲全文。
         """
-        esc = re.escape(vol_name)
-        pat = re.compile(rf'(###\s*{esc}[^\n]*\n).*?(?=\n###\s|$)', re.DOTALL)
-        m = pat.search(outline)
-        if m:
-            return outline[:m.start()] + m.group(1) + new_text.rstrip() + "\n" + outline[m.end():]
-        return outline.rstrip() + f"\n\n### {vol_name}\n{new_text}\n"
+        vol_num = self._volume_num_from_name(vol_name)
+        prefix, parts = self._split_summary_blocks(outline)
+        matched = [i for i in range(1, len(parts), 2)
+                   if self._header_vol_num(parts[i]) == vol_num]
+        if matched:
+            first = matched[0]
+            keep = set(range(1, len(parts), 2)) - set(matched[1:])
+            return prefix + self._rebuild_scope(parts, keep, replace_body_of=first, new_body=new_text.rstrip())
+        if outline.strip():
+            return outline.rstrip() + f"\n\n### {vol_name}\n{new_text.rstrip()}\n"
+        return f"### {vol_name}\n{new_text.rstrip()}\n"
 
     def ensure_outline_for_chapter(self, chapter_num: int, max_tokens: int = 4000):
         """章节生成前置保障：若该章所属卷尚无逐章概要，自动惰性生成（TODO 3.2.0 触发时机）"""
@@ -1034,6 +1040,83 @@ class FullNovelWorkflow:
         if not m:
             return None
         return FullNovelWorkflow._cn_to_int(m.group(1))
+
+    @staticmethod
+    def _header_vol_num(header: str) -> Optional[int]:
+        """从「### 卷名」块头提取卷号（忽略 markdown 加粗与（第X-Y章）范围后缀）"""
+        return FullNovelWorkflow._volume_num_from_name(
+            re.sub(r'^#{1,6}\s*', '', header).replace("*", "").strip())
+
+    @staticmethod
+    def _header_plain_name(header: str) -> str:
+        """块头去掉 markdown（###/加粗）与（第X-Y章）范围后缀后的纯卷名"""
+        s = re.sub(r'^#{1,6}\s*', '', header).replace("*", "").strip()
+        s = re.sub(r'[（(]\s*第\s*[\d一二三四五六七八九十两]+\s*[-~—至]\s*[\d一二三四五六七八九十两]+\s*章?\s*[)）].*$', '', s)
+        return s.strip()
+
+    @classmethod
+    def _split_summary_blocks(cls, outline: str) -> tuple:
+        """把大纲切为逐章概要段（marker 之后）内的「### 卷名」块。
+
+        返回 (prefix, parts)：prefix 为 marker 之前原文；parts 为 re.split 结果，
+        偶数下标为块间文本（含 marker 前导/分隔线），奇数下标为「### 卷名」块头行。
+        无 marker 时视整篇为段（兼容旧数据）。
+        """
+        marker_idx = cls._find_volume_chapter_marker(outline)
+        scope_start = marker_idx if marker_idx >= 0 else 0
+        return outline[:scope_start], re.split(r'(?m)^(###[^\n]*)$', outline[scope_start:])
+
+    @staticmethod
+    def _rebuild_scope(parts: list, keep_headers: set, replace_body_of=None, new_body="") -> str:
+        """按保留块头集合重建逐章概要段：被删块的正文一并丢弃；
+        replace_body_of 指定的块正文用 new_body 替换。"""
+        out = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                if i in keep_headers:
+                    out.append(part)
+            elif i == 0 or (i - 1) in keep_headers:
+                out.append(new_body if (i - 1) == replace_body_of else part)
+        return "".join(out).rstrip() + "\n"
+
+    @classmethod
+    def deduplicate_summary_blocks(cls, outline: str, plan: Optional[list] = None) -> tuple:
+        """清理逐章概要段内同一卷的重复「### 卷名」块：每组同卷块只保留一个，其余删除。
+
+        保留规则：优先保留块头与 volume_plan 卷名完全一致的块；否则保留该卷最后一块。
+        返回 (新大纲, 删除块数)；无重复时原样返回。
+        """
+        if not outline:
+            return outline, 0
+        prefix, parts = cls._split_summary_blocks(outline)
+        groups = {}
+        for i in range(1, len(parts), 2):
+            num = cls._header_vol_num(parts[i])
+            if num is not None:
+                groups.setdefault(num, []).append(i)
+        plan_names = {}
+        for v in (plan or []):
+            n = cls._volume_num_from_name(v.get("name", ""))
+            if n is not None:
+                plan_names.setdefault(n, (v.get("name") or "").strip())
+        keep = set(range(1, len(parts), 2))
+        removed = 0
+        for num, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue
+            chosen = None
+            plan_name = plan_names.get(num)
+            if plan_name:
+                chosen = next((i for i in idxs if cls._header_plain_name(parts[i]) == plan_name), None)
+            if chosen is None:
+                chosen = idxs[-1]
+            for i in idxs:
+                if i != chosen:
+                    keep.discard(i)
+                    removed += 1
+        if not removed:
+            return outline, 0
+        return prefix + cls._rebuild_scope(parts, keep), removed
 
     
     def _parse_volumes(self, volume_outline: str, total_chapters: int) -> list:
@@ -1647,11 +1730,12 @@ class FullNovelWorkflow:
 
         # 记忆自动闭环：前面的章被改动导致后续章台账/摘要 stale 时，自动补齐
         # （否则本章生成时前情回顾/台账注入的是残缺记忆，会破坏一致性）
+        # 只重算缺失记录的章（不浪费 API 全量重算）
         if self.vs.load_extra_data("ledger_stale", False):
             logger.info("检测到台账 stale，生成前自动重建记忆")
-            self._report("正在自动重建台账与摘要（章节变动导致记忆过期）…")
+            self._report("正在自动重建账本与摘要（章节变动导致记忆过期）…")
             try:
-                self.rebuild_memory(regen=True)
+                self.sync_memory(regen=True)
             except Exception as e:
                 logger.warning(f"自动记忆重建失败（不影响本章生成）: {e}")
         
@@ -1786,9 +1870,12 @@ class FullNovelWorkflow:
     
     def _delete_stale_chapter(self, chapter_num: int):
         """删除存储中当前章节的旧数据，避免旧标题/内容污染检索结果。
-        必须在用户确认生成方式之后调用（断点弹窗选择"稍后决定"时不得删除旧正文）。"""
+        必须在用户确认生成方式之后调用（断点弹窗选择"稍后决定"时不得删除旧正文）。
+        同步清理该章的评审/黄金开篇数据（旧评审针对旧正文，正文被替换后必然失效）。"""
         self.vs.delete_section("chapter", f"chapter_{chapter_num}")
-        logger.info(f"已预删除存储中 chapter_{chapter_num} 的旧数据")
+        self.vs.delete_extra_field(f"chapter_review_{chapter_num}")
+        self.vs.delete_extra_field(f"chapter_golden_{chapter_num}")
+        logger.info(f"已预删除存储中 chapter_{chapter_num} 的旧数据（含评审/黄金开篇）")
 
     def _chapter_hard_requirements(self, phase: str, target_words: int, anti_rush: str) -> str:
         """按阶段生成章节硬性要求文本"""
@@ -2310,7 +2397,7 @@ class FullNovelWorkflow:
         1. 删除该章及之后所有章的 delta 与摘要快照（它们基于旧内容产出，已不可信）；
         2. 用剩余 delta 重建合并态（旧章引入的伏笔/状态被精确撤销）；
         3. 若之后还存在已生成章节，标记 ledger_stale——这些章的 delta 缺失，
-           可通过 rebuild_memory(regen=True) 逐章重新调 LLM 补齐（有 token 成本）。
+           可通过 sync_memory(regen=True) 逐章重新调 LLM 补齐（只重算缺失章，有 token 成本）。
         """
         deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
         summaries = self.vs.load_extra_data("rolling_summaries", {}) or {}
@@ -2333,37 +2420,62 @@ class FullNovelWorkflow:
         else:
             self.vs.save_extra_data("ledger_stale", False)
 
-    def rebuild_memory(self, from_chapter: int = 1, regen: bool = False, max_tokens: int = 1500):
-        """手动触发记忆重建（UI "重建台账与摘要"按钮）。
+    def missing_memory_chapters(self) -> list:
+        """有正文但缺少按章记忆记录的章节（账本过期/缺失章）。免费计算，不调用 API。
 
-        regen=False（默认，零成本）：仅用已有 delta 重建合并态；缺失 delta 的章保持 stale 标记。
-        regen=True（烧 token，UI 需明示成本）：对 from_chapter 起所有已有正文的章
-        逐章重新调用 LLM 产出 delta 与摘要快照，完成后清除 stale 标记。
+        按章 delta 是每章 AI 记的"原始账页"；章节被改写/编辑/导入后旧账页会被作废
+        （见 invalidate_memory_from），此处即找出"有正文但没账页"的章——这些章
+        必须让 AI 重新读取正文重写账页才能补齐。
         """
+        chapters = self.novel_info.get("chapters", {})
+        deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
+        return sorted(int(k) for k in chapters
+                      if str(k).isdigit()
+                      and (chapters[k].get("content") or "").strip()
+                      and str(k) not in deltas)
+
+    def sync_memory(self, regen: bool = False, all_chapters: bool = False, max_tokens: int = 1500) -> dict:
+        """同步账本（UI「同步账本」按钮的底层逻辑）。
+
+        regen=False（默认，零成本）：只用已有按章记录重算合并态/摘要展示层，
+        不调用 AI；缺失记录的章保持缺失状态（返回 missing 供前端提示）。
+        regen=True（烧 token，UI 需明示成本）：只重算"有正文但缺按章记录"的章
+        （见 missing_memory_chapters）；all_chapters=True 时从第 1 章全量重算。
+        全部补齐后自动清除过期标记。
+        返回 {"regenerated": 重算章数, "ledger": 合并台账, "summary": 近期摘要,
+              "missing": 仍缺失的章}
+        """
+        chapters = self.novel_info.get("chapters", {})
         if not regen:
             merged, summary = self.rebuild_memory_from_deltas()
-            return {"regenerated": 0, "ledger": merged, "summary": summary}
+            return {"regenerated": 0, "ledger": merged, "summary": summary,
+                    "missing": self.missing_memory_chapters()}
 
-        chapters = self.novel_info.get("chapters", {})
-        targets = sorted(int(k) for k in chapters
-                         if str(k).isdigit() and int(k) >= from_chapter
-                         and (chapters[k].get("content") or "").strip())
+        if all_chapters:
+            targets = sorted(int(k) for k in chapters
+                             if str(k).isdigit() and (chapters[k].get("content") or "").strip())
+        else:
+            targets = self.missing_memory_chapters()
         if targets:
-            # 清掉目标范围的旧 delta，逐章重算
-            deltas = self.vs.load_extra_data("ledger_deltas", {}) or {}
-            summaries = self.vs.load_extra_data("rolling_summaries", {}) or {}
-            deltas = {k: v for k, v in deltas.items() if int(k) < from_chapter}
-            summaries = {k: v for k, v in summaries.items() if int(k) < from_chapter}
+            # 只清目标章的旧账页（其他章账页原样保留），逐章重新调 LLM 产出
+            deltas = {k: v for k, v in (self.vs.load_extra_data("ledger_deltas", {}) or {}).items()
+                      if int(k) not in targets}
             self.vs.save_extra_data("ledger_deltas", deltas)
-            self.vs.save_extra_data("rolling_summaries", summaries)
-            self.rebuild_memory_from_deltas(upto_chapter=from_chapter - 1)
+            for snap_key in ("rolling_summaries", "rolling_summaries_full"):
+                snaps = {k: v for k, v in (self.vs.load_extra_data(snap_key, {}) or {}).items()
+                         if int(k) not in targets}
+                self.vs.save_extra_data(snap_key, snaps)
+            self.rebuild_memory_from_deltas()
             for n in targets:
-                self._report(f"正在重建第{n}章的台账与摘要（{targets.index(n) + 1}/{len(targets)}）…")
+                self._report(f"正在重建第{n}章的账本与摘要（{targets.index(n) + 1}/{len(targets)}）…")
                 content = chapters[str(n)]["content"]
                 self.update_memory(n, content, max_tokens=max_tokens)
-        self.vs.save_extra_data("ledger_stale", False)
+        if not self.missing_memory_chapters():
+            self.vs.save_extra_data("ledger_stale", False)
+            self.vs.save_extra_data("ledger_stale_from", None)
         merged, summary = self.rebuild_memory_from_deltas()
-        return {"regenerated": len(targets), "ledger": merged, "summary": summary}
+        return {"regenerated": len(targets), "ledger": merged, "summary": summary,
+                "missing": self.missing_memory_chapters()}
 
     @staticmethod
     def _chapter_excerpt(content: str, head: int = 2000, tail: int = 4000) -> str:
